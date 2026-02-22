@@ -1,0 +1,20 @@
+#ifndef PBR_COMBINE_H
+#define PBR_COMBINE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <libdragon.h>
+
+#include "pbr_types.h"
+
+const uint16_t *sprite_pixels_u16(const sprite_t *spr);
+bool sprite_dim_match(const sprite_t *spr, int w, int h);
+
+void combine_deferred_cpu(const uint16_t *albedo_rgba16,
+                          const uint16_t *packed16,
+                          uint16_t *out_rgba16,
+                          int w,
+                          int h,
+                          const MatcapSet *mats);
+
+#endif
