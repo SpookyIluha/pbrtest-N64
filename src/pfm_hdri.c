@@ -9,6 +9,12 @@
 
 #include "pfm_hdri.h"
 
+#define HDRI_BASE_PATH_MAX 512
+#define HDRI_PATH_MAX 640
+#define FIXED_ONE 256.0f
+
+static char g_hdri_base_path[HDRI_BASE_PATH_MAX];
+
 static inline uint32_t bswap32_local(uint32_t x)
 {
     return ((x & 0x000000FFu) << 24) |
@@ -39,25 +45,29 @@ static bool read_token(FILE *f, char *out, size_t out_len)
     return i > 0;
 }
 
-void free_hdri(HDRISet *hdri)
+static void normalize_base_path(const char *in, char *out, size_t out_len)
 {
-    if (!hdri) return;
-    free(hdri->rgb);
-    hdri->rgb = NULL;
-    for (int i = 0; i < 4; i++) {
-        free(hdri->prefilter[i]);
-        hdri->prefilter[i] = NULL;
+    size_t n = strlen(in);
+    if (n + 1 > out_len) n = out_len - 1;
+    memcpy(out, in, n);
+    out[n] = '\0';
+
+    if (n >= 4) {
+        const char *ext = &out[n - 4];
+        if (strcmp(ext, ".pbm") == 0 || strcmp(ext, ".PBM") == 0) {
+            out[n - 4] = '\0';
+        }
     }
-    free(hdri->diffuse_irr);
-    hdri->diffuse_irr = NULL;
-    hdri->w = 0;
-    hdri->h = 0;
 }
 
-bool load_pfm_hdri(const char *path, HDRISet *out)
+static bool build_suffixed_path(char *out, size_t out_len, const char *base, const char *suffix)
 {
-    memset(out, 0, sizeof(*out));
+    int rc = snprintf(out, out_len, "%s%s.pbm", base, suffix);
+    return rc > 0 && (size_t)rc < out_len;
+}
 
+static bool load_pfm_file(const char *path, int *w_out, int *h_out, float **rgb_out)
+{
     FILE *f = fopen(path, "rb");
     if (!f) {
         debugf("PFM open failed: %s\n", path);
@@ -66,27 +76,18 @@ bool load_pfm_hdri(const char *path, HDRISet *out)
 
     char tok[64] = {0};
     if (!read_token(f, tok, sizeof(tok)) || strcmp(tok, "PF") != 0) {
-        debugf("PFM header is not PF\n");
+        debugf("PFM header is not PF: %s\n", path);
         fclose(f);
         return false;
     }
-    if (!read_token(f, tok, sizeof(tok))) {
-        fclose(f);
-        return false;
-    }
+    if (!read_token(f, tok, sizeof(tok))) { fclose(f); return false; }
     int w = atoi(tok);
-    if (!read_token(f, tok, sizeof(tok))) {
-        fclose(f);
-        return false;
-    }
+    if (!read_token(f, tok, sizeof(tok))) { fclose(f); return false; }
     int h = atoi(tok);
-    if (!read_token(f, tok, sizeof(tok))) {
-        fclose(f);
-        return false;
-    }
+    if (!read_token(f, tok, sizeof(tok))) { fclose(f); return false; }
 
     if (w <= 0 || h <= 0) {
-        debugf("PFM invalid size %d x %d\n", w, h);
+        debugf("PFM invalid size %d x %d: %s\n", w, h, path);
         fclose(f);
         return false;
     }
@@ -105,9 +106,8 @@ bool load_pfm_hdri(const char *path, HDRISet *out)
 
     size_t got = fread(rgb, sizeof(float), count, f);
     fclose(f);
-
     if (got != count) {
-        debugf("PFM short read (%lu / %lu)\n", (unsigned long)got, (unsigned long)count);
+        debugf("PFM short read (%lu/%lu): %s\n", (unsigned long)got, (unsigned long)count, path);
         free(rgb);
         return false;
     }
@@ -127,311 +127,112 @@ bool load_pfm_hdri(const char *path, HDRISet *out)
         rgb[i] *= abs_scale;
     }
 
-    out->w = w;
-    out->h = h;
-    out->rgb = rgb;
+    *w_out = w;
+    *h_out = h;
+    *rgb_out = rgb;
     return true;
 }
 
-static inline int wrap_x(int x, int w)
+static bool load_pfm_suffixed(const char *base, const char *suffix, int *w, int *h, float **rgb)
 {
-    x %= w;
-    if (x < 0) x += w;
-    return x;
-}
-
-static inline int clamp_y(int y, int h)
-{
-    if (y < 0) return 0;
-    if (y >= h) return h - 1;
-    return y;
-}
-
-static inline float clampf_local(float v, float lo, float hi)
-{
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
-static inline float dot3(const float a[3], const float b[3])
-{
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-
-static inline void cross3(const float a[3], const float b[3], float out[3])
-{
-    out[0] = a[1] * b[2] - a[2] * b[1];
-    out[1] = a[2] * b[0] - a[0] * b[2];
-    out[2] = a[0] * b[1] - a[1] * b[0];
-}
-
-static inline void normalize3(float v[3])
-{
-    float l2 = dot3(v, v);
-    if (l2 <= 1e-20f) {
-        v[0] = 0.0f;
-        v[1] = 0.0f;
-        v[2] = 1.0f;
-        return;
+    char path[HDRI_PATH_MAX];
+    if (!build_suffixed_path(path, sizeof(path), base, suffix)) {
+        debugf("HDRI path too long: base=%s suffix=%s\n", base, suffix);
+        return false;
     }
-    float inv = 1.0f / sqrtf(l2);
-    v[0] *= inv;
-    v[1] *= inv;
-    v[2] *= inv;
+    return load_pfm_file(path, w, h, rgb);
 }
 
-static inline void build_basis(const float N[3], float T[3], float B[3])
+static inline uint16_t quantize_hdr_u88(float v)
 {
-    float up[3] = {0.0f, 1.0f, 0.0f};
-    if (fabsf(N[1]) > 0.999f) {
-        up[0] = 1.0f;
-        up[1] = 0.0f;
-        up[2] = 0.0f;
+    float scaled = v * FIXED_ONE;
+    if (scaled < 0.0f) return 0;
+    if (scaled > 65535.0f) return 65535;
+    return (uint16_t)scaled;
+}
+
+static hdr16_rgb_t *convert_rgbf_to_u88(const float *rgb, int w, int h)
+{
+    size_t texels = (size_t)w * (size_t)h;
+    hdr16_rgb_t *out = malloc(sizeof(hdr16_rgb_t) * texels);
+    if (!out) return NULL;
+
+    for (size_t i = 0; i < texels; i++) {
+        out[i].c[0] = quantize_hdr_u88(rgb[i * 3u + 0u]);
+        out[i].c[1] = quantize_hdr_u88(rgb[i * 3u + 1u]);
+        out[i].c[2] = quantize_hdr_u88(rgb[i * 3u + 2u]);
     }
-    cross3(up, N, T);
-    normalize3(T);
-    cross3(N, T, B);
+    return out;
 }
 
-static inline void texel_to_dir(int x, int y, int w, int h, float dir[3])
+void free_hdri(HDRISet *hdri)
 {
-    const float pi = 3.14159265358979323846f;
-    float u = ((float)x + 0.5f) / (float)w;
-    float v = ((float)y + 0.5f) / (float)h;
-    float phi = (u - 0.5f) * (2.0f * pi);
-    float theta = v * pi;
-    float st = sinf(theta);
+    if (!hdri) return;
 
-    dir[0] = cosf(phi) * st;
-    dir[1] = cosf(theta);
-    dir[2] = sinf(phi) * st;
+    free(hdri->diffuse);
+    free(hdri->rough25);
+    free(hdri->rough75);
+    hdri->diffuse = NULL;
+    hdri->rough25 = NULL;
+    hdri->rough75 = NULL;
+    hdri->w = 0;
+    hdri->h = 0;
 }
 
-static inline void sample_equirect_bilinear(const float *img, int w, int h, const float dir[3], float out_rgb[3])
+bool load_pfm_hdri(const char *path, HDRISet *out)
 {
-    const float inv2pi = 0.15915494309189535f; /* 1/(2*pi) */
-    const float invpi = 0.3183098861837907f;   /* 1/pi */
+    char base[HDRI_BASE_PATH_MAX];
 
-    float u = atan2f(dir[2], dir[0]) * inv2pi + 0.5f;
-    float v = acosf(clampf_local(dir[1], -1.0f, 1.0f)) * invpi;
+    int dw = 0, dh = 0, lw = 0, lh = 0, hw = 0, hh = 0;
+    float *diff_f = NULL;
+    float *low_f = NULL;
+    float *high_f = NULL;
 
-    float fx = u * (float)w - 0.5f;
-    float fy = v * (float)h - 0.5f;
-    int x0 = (int)floorf(fx);
-    int y0 = (int)floorf(fy);
-    int x1 = x0 + 1;
-    int y1 = y0 + 1;
-    float tx = fx - (float)x0;
-    float ty = fy - (float)y0;
+    hdr16_rgb_t *diff_u88 = NULL;
+    hdr16_rgb_t *low_u88 = NULL;
+    hdr16_rgb_t *high_u88 = NULL;
 
-    x0 = wrap_x(x0, w);
-    x1 = wrap_x(x1, w);
-    y0 = clamp_y(y0, h);
-    y1 = clamp_y(y1, h);
+    normalize_base_path(path, base, sizeof(base));
 
-    const float *c00 = &img[((size_t)y0 * (size_t)w + (size_t)x0) * 3u];
-    const float *c10 = &img[((size_t)y0 * (size_t)w + (size_t)x1) * 3u];
-    const float *c01 = &img[((size_t)y1 * (size_t)w + (size_t)x0) * 3u];
-    const float *c11 = &img[((size_t)y1 * (size_t)w + (size_t)x1) * 3u];
+    if (!load_pfm_suffixed(base, "_d", &dw, &dh, &diff_f)) goto fail;
+    if (!load_pfm_suffixed(base, "_s25", &lw, &lh, &low_f)) goto fail;
+    if (!load_pfm_suffixed(base, "_s75", &hw, &hh, &high_f)) goto fail;
 
-    for (int c = 0; c < 3; c++) {
-        float a = c00[c] + (c10[c] - c00[c]) * tx;
-        float b = c01[c] + (c11[c] - c01[c]) * tx;
-        out_rgb[c] = a + (b - a) * ty;
-    }
-}
-
-static inline float radical_inverse_vdc(uint32_t bits)
-{
-    bits = (bits << 16) | (bits >> 16);
-    bits = ((bits & 0x55555555u) << 1) | ((bits & 0xAAAAAAAAu) >> 1);
-    bits = ((bits & 0x33333333u) << 2) | ((bits & 0xCCCCCCCCu) >> 2);
-    bits = ((bits & 0x0F0F0F0Fu) << 4) | ((bits & 0xF0F0F0F0u) >> 4);
-    bits = ((bits & 0x00FF00FFu) << 8) | ((bits & 0xFF00FF00u) >> 8);
-    return (float)bits * 2.3283064365386963e-10f;
-}
-
-static inline void hammersley_2d(uint32_t i, uint32_t n, float xi[2])
-{
-    xi[0] = (float)i / (float)n;
-    xi[1] = radical_inverse_vdc(i);
-}
-
-static inline void sample_cosine_hemisphere(const float xi[2], float out[3])
-{
-    const float pi2 = 6.28318530717958647692f;
-    float phi = pi2 * xi[0];
-    float cos_theta = sqrtf(1.0f - xi[1]);
-    float sin_theta = sqrtf(xi[1]);
-
-    out[0] = cosf(phi) * sin_theta;
-    out[1] = sinf(phi) * sin_theta;
-    out[2] = cos_theta;
-}
-
-static inline void sample_ggx_half_vector(const float xi[2], float roughness, float out[3])
-{
-    const float pi2 = 6.28318530717958647692f;
-    float a = roughness * roughness;
-    if (a < 1e-3f) a = 1e-3f;
-    float a2 = a * a;
-    float phi = pi2 * xi[0];
-    float cos_theta = sqrtf((1.0f - xi[1]) / (1.0f + (a2 - 1.0f) * xi[1]));
-    float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
-
-    out[0] = cosf(phi) * sin_theta;
-    out[1] = sinf(phi) * sin_theta;
-    out[2] = cos_theta;
-}
-
-static inline void tangent_to_world(const float local[3], const float T[3], const float B[3], const float N[3], float out[3])
-{
-    out[0] = T[0] * local[0] + B[0] * local[1] + N[0] * local[2];
-    out[1] = T[1] * local[0] + B[1] * local[1] + N[1] * local[2];
-    out[2] = T[2] * local[0] + B[2] * local[1] + N[2] * local[2];
-    normalize3(out);
-}
-
-static inline void debug_progress_row(const char *stage_name, int y, int h, int *last_pct)
-{
-    int pct = ((y + 1) * 100) / h;
-    if (pct != *last_pct && (pct == 1 || pct % 5 == 0 || pct == 100)) {
-        debugf("%s: %d%%\n", stage_name, pct);
-        *last_pct = pct;
-    }
-}
-
-static void convolve_diffuse_irradiance(const float *src, float *dst, int w, int h, uint32_t samples, const char *stage_name)
-{
-    const float pi = 3.14159265358979323846f;
-    int last_pct = -1;
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            float N[3], T[3], B[3];
-            texel_to_dir(x, y, w, h, N);
-            build_basis(N, T, B);
-
-            float accum[3] = {0.0f, 0.0f, 0.0f};
-            for (uint32_t s = 0; s < samples; s++) {
-                float xi[2], L_local[3], L_world[3], sample_rgb[3];
-                hammersley_2d(s, samples, xi);
-                sample_cosine_hemisphere(xi, L_local);
-                tangent_to_world(L_local, T, B, N, L_world);
-                sample_equirect_bilinear(src, w, h, L_world, sample_rgb);
-                accum[0] += sample_rgb[0];
-                accum[1] += sample_rgb[1];
-                accum[2] += sample_rgb[2];
-            }
-
-            float scale = pi / (float)samples;
-            float *out = &dst[((size_t)y * (size_t)w + (size_t)x) * 3u];
-            out[0] = accum[0] * scale;
-            out[1] = accum[1] * scale;
-            out[2] = accum[2] * scale;
-        }
-        debug_progress_row(stage_name, y, h, &last_pct);
-    }
-}
-
-static void prefilter_specular_ggx(const float *src, float *dst, int w, int h, float roughness, uint32_t samples, const char *stage_name)
-{
-    int last_pct = -1;
-
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            float N[3], T[3], B[3];
-            texel_to_dir(x, y, w, h, N);
-            build_basis(N, T, B);
-
-            float V[3] = {N[0], N[1], N[2]};
-            float accum[3] = {0.0f, 0.0f, 0.0f};
-            float weight = 0.0f;
-
-            for (uint32_t s = 0; s < samples; s++) {
-                float xi[2], H_local[3], H_world[3], sample_rgb[3];
-                hammersley_2d(s, samples, xi);
-                sample_ggx_half_vector(xi, roughness, H_local);
-                tangent_to_world(H_local, T, B, N, H_world);
-
-                float VdotH = dot3(V, H_world);
-                if (VdotH <= 0.0f) continue;
-
-                float L[3] = {
-                    2.0f * VdotH * H_world[0] - V[0],
-                    2.0f * VdotH * H_world[1] - V[1],
-                    2.0f * VdotH * H_world[2] - V[2]
-                };
-                normalize3(L);
-
-                float NdotL = dot3(N, L);
-                if (NdotL <= 0.0f) continue;
-
-                sample_equirect_bilinear(src, w, h, L, sample_rgb);
-                accum[0] += sample_rgb[0] * NdotL;
-                accum[1] += sample_rgb[1] * NdotL;
-                accum[2] += sample_rgb[2] * NdotL;
-                weight += NdotL;
-            }
-
-            float *out = &dst[((size_t)y * (size_t)w + (size_t)x) * 3u];
-            if (weight > 1e-6f) {
-                float inv = 1.0f / weight;
-                out[0] = accum[0] * inv;
-                out[1] = accum[1] * inv;
-                out[2] = accum[2] * inv;
-            } else {
-                out[0] = 0.0f;
-                out[1] = 0.0f;
-                out[2] = 0.0f;
-            }
-        }
-        debug_progress_row(stage_name, y, h, &last_pct);
-    }
-}
-
-static void free_prefilter_buffers(HDRISet *io)
-{
-    for (int i = 0; i < 4; i++) {
-        free(io->prefilter[i]);
-        io->prefilter[i] = NULL;
-    }
-    free(io->diffuse_irr);
-    io->diffuse_irr = NULL;
-}
-
-void prefilter_hdri_roughness_4(const HDRISet *in, HDRISet *io)
-{
-    (void)in;
-
-    const float roughness_levels[4] = {0.12f, 0.22f, 0.52f, 0.75f};
-    const uint32_t diffuse_samples = 64;
-    const uint32_t spec_samples = 128;
-    size_t size = sizeof(float) * (size_t)io->w * (size_t)io->h * 3u;
-
-    free_prefilter_buffers(io);
-
-    for (int i = 0; i < 4; i++) {
-        char stage_name[64];
-        snprintf(stage_name, sizeof(stage_name), "HDRI spec prefilter L%d r=%.2f", i, roughness_levels[i]);
-        debugf("%s: 0%%\n", stage_name);
-
-        io->prefilter[i] = malloc(size);
-        if (!io->prefilter[i]) {
-            debugf("prefilter alloc failed level %d\n", i);
-            free_prefilter_buffers(io);
-            return;
-        }
-        prefilter_specular_ggx(io->rgb, io->prefilter[i], io->w, io->h, roughness_levels[i], spec_samples, stage_name);
+    if (dw != lw || dh != lh || dw != hw || dh != hh) {
+        debugf("HDRI size mismatch: _d=%dx%d _s25=%dx%d _s75=%dx%d\n", dw, dh, lw, lh, hw, hh);
+        goto fail;
     }
 
-    debugf("HDRI diffuse irradiance: 0%%\n");
-    io->diffuse_irr = malloc(size);
-    if (!io->diffuse_irr) {
-        debugf("diffuse irr alloc failed\n");
-        free_prefilter_buffers(io);
-        return;
-    }
-    convolve_diffuse_irradiance(io->rgb, io->diffuse_irr, io->w, io->h, diffuse_samples, "HDRI diffuse irradiance");
+    diff_u88 = convert_rgbf_to_u88(diff_f, dw, dh);
+    low_u88 = convert_rgbf_to_u88(low_f, lw, lh);
+    high_u88 = convert_rgbf_to_u88(high_f, hw, hh);
+    if (!diff_u88 || !low_u88 || !high_u88) goto fail;
+
+    free(diff_f);
+    free(low_f);
+    free(high_f);
+    diff_f = NULL;
+    low_f = NULL;
+    high_f = NULL;
+
+    free_hdri(out);
+    memset(out, 0, sizeof(*out));
+    out->w = dw;
+    out->h = dh;
+    out->diffuse = diff_u88;
+    out->rough25 = low_u88;
+    out->rough75 = high_u88;
+
+    snprintf(g_hdri_base_path, sizeof(g_hdri_base_path), "%s", base);
+    debugf("Loaded HDRI triplet (u8.8): %s_d/_s25/_s75.pbm (%dx%d)\n", base, dw, dh);
+    return true;
+
+fail:
+    free(diff_f);
+    free(low_f);
+    free(high_f);
+    free(diff_u88);
+    free(low_u88);
+    free(high_u88);
+    return false;
 }

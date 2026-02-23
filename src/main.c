@@ -13,10 +13,11 @@ const resolution_t RESOLUTION_256x224 = {.width = 256, .height = 224, .interlace
 
 #define FB_COUNT 3
 
-#define HDRI_PATH "rom:/textures/ferndale_studio_12_2k.pbm"
+#define HDRI_PATH "rom:/textures/ferndale_studio"
 #define GBUFFER_ALBEDO_PATH "rom:/models/albedo2.rgba16.sprite"
 #define GBUFFER_PACKED_PATH "rom:/models/packed2.rgba16.sprite"
-#define DEBUG_DRAW_MATCAPS 0
+#define DEBUG_DRAW_MATCAPS 1
+#define DRAW_FRAME 0
 
 static inline uint16_t pack_rgb5551_from_u88(uint16_t r88, uint16_t g88, uint16_t b88)
 {
@@ -30,35 +31,33 @@ static inline uint16_t pack_rgb5551_from_u88(uint16_t r88, uint16_t g88, uint16_
     return (uint16_t)((r5 << 11) | (g5 << 6) | (b5 << 1) | 1u);
 }
 
-static inline const hdr16_rgb_t *debug_matcap_texel(const MatcapSet *mats, int group, int roughness, int tex_idx)
+#if DEBUG_DRAW_MATCAPS
+static inline const hdr16_rgb_t *debug_matcap_texel(const MatcapSet *mats, int slot, int tex_idx)
 {
-    if (group == 0) {
-        /* Diffuse has one map, repeat across roughness columns. */
+    if (slot == 0) {
         return &mats->diffuse[tex_idx];
     }
-    if (group == 1) {
-        return &mats->spec[(roughness << 10) | tex_idx];
+    if (slot == 1) {
+        return &mats->rough25[tex_idx];
     }
-    if (group == 2) {
-        return &mats->spec_mod[(roughness << 10) | tex_idx];
-    }
-    return &mats->spec_fres[(roughness << 10) | tex_idx];
+    return &mats->rough75[tex_idx];
 }
 
 static void draw_debug_matcaps(uint16_t *dst, int w, int h, const MatcapSet *mats)
 {
-    const int cols = 8;    /* roughness 0..7 */
-    const int rows = 4;    /* diffuse/spec/spec_mod/spec_fres */
-    const int tile = 30;   /* fit 8 columns into 256-wide frame */
+    const int cols = 3;    /* diffuse / rough25 / rough75 */
+    const int rows = 1;
+    const int tile = 80;
     const int pad = 1;
     const int ox0 = 2;
     const int oy0 = 2;
-    const int src_size = 32;
+    const int src_size = MATCAP_SIZE;
 
-    for (int group = 0; group < rows; group++) {
-        for (int roughness = 0; roughness < cols; roughness++) {
-            int ox = ox0 + roughness * (tile + pad);
-            int oy = oy0 + group * (tile + pad);
+    for (int yslot = 0; yslot < rows; yslot++) {
+        for (int xslot = 0; xslot < cols; xslot++) {
+            int ox = ox0 + xslot * (tile + pad);
+            int oy = oy0 + yslot * (tile + pad);
+            int slot = xslot;
 
             for (int ty = 0; ty < tile; ty++) {
                 int py = oy + ty;
@@ -69,8 +68,8 @@ static void draw_debug_matcaps(uint16_t *dst, int w, int h, const MatcapSet *mat
                     int px = ox + tx;
                     if ((unsigned)px >= (unsigned)w) continue;
                     int sx = (tx * src_size) / tile;
-                    int sidx = (sy << 5) | sx;
-                    const hdr16_rgb_t *src = debug_matcap_texel(mats, group, roughness, sidx);
+                    int sidx = sy * src_size + sx;
+                    const hdr16_rgb_t *src = debug_matcap_texel(mats, slot, sidx);
                     dst[(size_t)py * (size_t)w + (size_t)px] =
                         pack_rgb5551_from_u88(src->c[0], src->c[1], src->c[2]);
                 }
@@ -78,6 +77,7 @@ static void draw_debug_matcaps(uint16_t *dst, int w, int h, const MatcapSet *mat
         }
     }
 }
+#endif
 
 static bool load_gbuffers_from_sprites(const char *albedo_path, const char *packed_path, sprite_t **albedo, sprite_t **packed)
 {
@@ -95,21 +95,21 @@ static bool load_gbuffers_from_sprites(const char *albedo_path, const char *pack
 static void setup_default_lighting(LightingState *ls)
 {
     memset(ls, 0, sizeof(*ls));
-    ls->count = 0;
+    ls->count = 2;
 
     ls->dir[0][0] = 0.707f;
     ls->dir[0][1] = 0.577f;
     ls->dir[0][2] = 0.408f;
-    ls->color[0][0] = 10.0f;
-    ls->color[0][1] = 10.0f;
-    ls->color[0][2] = 10.0f;
+    ls->color[0][0] = 1.0f;
+    ls->color[0][1] = 1.0f;
+    ls->color[0][2] = 1.0f;
 
-    /*ls->dir[1][0] = -0.4f;
+    ls->dir[1][0] = -0.4f;
     ls->dir[1][1] = 0.9f;
     ls->dir[1][2] = 0.2f;
-    ls->color[1][0] = 10.5f;
-    ls->color[1][1] = 8.0f;
-    ls->color[1][2] = 8.0f;*/
+    ls->color[1][0] = 1.5f;
+    ls->color[1][1] = 1.0f;
+    ls->color[1][2] = 1.0f;
 }
 
 int main(void)
@@ -140,13 +140,11 @@ int main(void)
         for (;;) {}
     }
 
-    HDRISet hdri;
+    HDRISet hdri = {0};
     if (!load_pfm_hdri(HDRI_PATH, &hdri)) {
         debugf("HDRI load failed\n");
         for (;;) {}
     }
-
-    prefilter_hdri_roughness_4(&hdri, &hdri);
 
     MatcapSet mats;
     if (!alloc_matcaps(&mats)) {
@@ -177,7 +175,7 @@ int main(void)
     for (;;) {
         uint64_t t_frame0 = get_ticks_us();
 
-        yaw += 0.1f;
+        yaw += 0.03f;
         build_camera_from_yaw(yaw, &cam);
 
         uint64_t t_mat0 = get_ticks_us();
@@ -185,7 +183,9 @@ int main(void)
         uint64_t t_mat1 = get_ticks_us();
 
         uint64_t t_com0 = get_ticks_us();
+#if DRAW_FRAME
         combine_deferred_cpu(albedo, packed, final_rgba16, w, h, &mats);
+#endif
         uint64_t t_com1 = get_ticks_us();
 #if DEBUG_DRAW_MATCAPS
         draw_debug_matcaps(final_rgba16, w, h, &mats);

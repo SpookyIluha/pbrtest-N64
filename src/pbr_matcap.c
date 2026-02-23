@@ -5,30 +5,23 @@
 #include <libdragon.h>
 
 #include "pbr_matcap.h"
+#include "pbr_u88.h"
 
 #define PI_F 3.14159265358979323846f
-#define FIXED_ONE 256.0f
 #define INV_PI_F (1.0f / PI_F)
 #define HALF_INV_PI_F (0.5f / PI_F)
+#define FRESNEL_F0_DEFAULT 0.04f
 #define INV_MATCAP_SIZE (1.0f / (float)MATCAP_SIZE)
 
-typedef struct {
-    bool valid;
-    fm_vec3_t n;
-} MatcapTexelCache;
-
-static MatcapTexelCache g_texel_cache[MATCAP_SIZE * MATCAP_SIZE];
-static bool g_texel_cache_init = false;
-static inline uint16_t quantize_hdr(float v);
+static float g_fresnel_mask_f32[MATCAP_SIZE * MATCAP_SIZE];
+static uint16_t g_fresnel_mask_u88[MATCAP_SIZE * MATCAP_SIZE];
+static bool g_fresnel_masks_init = false;
 
 static inline void set_rgb_const(hdr16_rgb_t *dst, uint16_t v)
 {
-    for (int c = 0; c < 3; c++) dst->c[c] = v;
-}
-
-static inline void set_rgb_quantized(hdr16_rgb_t *dst, const float src[3])
-{
-    for (int c = 0; c < 3; c++) dst->c[c] = quantize_hdr(src[c]);
+    dst->c[0] = v;
+    dst->c[1] = v;
+    dst->c[2] = v;
 }
 
 bool alloc_matcaps(MatcapSet *m)
@@ -36,17 +29,16 @@ bool alloc_matcaps(MatcapSet *m)
     memset(m, 0, sizeof(*m));
     m->w = MATCAP_SIZE;
     m->h = MATCAP_SIZE;
+
     size_t texels = (size_t)m->w * (size_t)m->h;
-    size_t chain_texels = 8u * texels;
-
     m->diffuse = malloc(sizeof(hdr16_rgb_t) * texels);
-    if (!m->diffuse) return false;
+    m->rough25 = malloc(sizeof(hdr16_rgb_t) * texels);
+    m->rough75 = malloc(sizeof(hdr16_rgb_t) * texels);
 
-    m->spec = malloc(sizeof(hdr16_rgb_t) * chain_texels);
-    m->spec_mod = malloc(sizeof(hdr16_rgb_t) * chain_texels);
-    m->spec_fres = malloc(sizeof(hdr16_rgb_t) * chain_texels);
-    if (!m->spec || !m->spec_mod || !m->spec_fres) return false;
-
+    if (!m->diffuse || !m->rough25 || !m->rough75) {
+        free_matcaps(m);
+        return false;
+    }
     return true;
 }
 
@@ -54,13 +46,11 @@ void free_matcaps(MatcapSet *m)
 {
     if (!m) return;
     free(m->diffuse);
+    free(m->rough25);
+    free(m->rough75);
     m->diffuse = NULL;
-    free(m->spec);
-    free(m->spec_mod);
-    free(m->spec_fres);
-    m->spec = NULL;
-    m->spec_mod = NULL;
-    m->spec_fres = NULL;
+    m->rough25 = NULL;
+    m->rough75 = NULL;
     m->w = 0;
     m->h = 0;
 }
@@ -97,41 +87,20 @@ static inline float fast_acosf(float x)
     return res;
 }
 
-static inline void sample_equirect_nearest(const float *img, int w, int h, const fm_vec3_t *dir, float out_rgb[3])
+static inline void sample_equirect_nearest_u88(const hdr16_rgb_t *img, int w, int h, const fm_vec3_t *dir, hdr16_rgb_t *out_rgb)
 {
+    if (!img || w <= 0 || h <= 0) {
+        set_rgb_const(out_rgb, U88_ONE);
+        return;
+    }
+
     float u = fm_atan2f(dir->z, dir->x) * HALF_INV_PI_F + 0.5f;
     float v = fast_acosf(dir->y) * INV_PI_F;
 
     int ix = wrap_x((int)(u * (float)w), w);
     int iy = clamp_y((int)(v * (float)h), h);
 
-    const float *s = &img[((size_t)iy * (size_t)w + (size_t)ix) * 3u];
-    out_rgb[0] = s[0];
-    out_rgb[1] = s[1];
-    out_rgb[2] = s[2];
-}
-
-static inline float ggx_G1(float NdotX, float a)
-{
-    float a2 = a * a;
-    float denom = NdotX + sqrtf(a2 + (1.0f - a2) * NdotX * NdotX);
-    return (2.0f * NdotX) / (denom + 1e-6f);
-}
-
-static inline float fresnel_schlick_scalar(float VdotH, float F0)
-{
-    float f = 1.0f - clampf_local(VdotH, 0.0f, 1.0f);
-    float f2 = f * f;
-    float f4 = f2 * f2;
-    return F0 + (1.0f - F0) * f4;
-}
-
-static inline uint16_t quantize_hdr(float v)
-{
-    float scaled = v * FIXED_ONE;
-    if (scaled < 0.0f) return 0;
-    if (scaled > 65535.0f) return 65535;
-    return (uint16_t)(scaled);
+    *out_rgb = img[(size_t)iy * (size_t)w + (size_t)ix];
 }
 
 static inline void rotate_y(fm_vec3_t *v, float cos_a, float sin_a)
@@ -142,28 +111,72 @@ static inline void rotate_y(fm_vec3_t *v, float cos_a, float sin_a)
     v->z = x * sin_a + z * cos_a;
 }
 
-static void init_texel_cache(void)
+static inline fm_vec3_t reflect_view_about_normal(const fm_vec3_t *n_view)
 {
-    if (g_texel_cache_init) return;
+    /* R = reflect(-V, N), with V=(0,0,1) in view space. */
+    float ndotv = n_view->z;
+    fm_vec3_t r = {{
+        2.0f * ndotv * n_view->x,
+        2.0f * ndotv * n_view->y,
+        2.0f * ndotv * ndotv - 1.0f
+    }};
+    return r;
+}
+
+static inline bool compute_forward_view(int x, int y, fm_vec3_t *out)
+{
+    float nx = ((float)x + 0.5f) * INV_MATCAP_SIZE * 2.0f - 1.0f;
+    float ny = 1.0f - (((float)y + 0.5f) * INV_MATCAP_SIZE * 2.0f);
+    float rr = nx * nx + ny * ny;
+    if (rr > 1.0f) {
+        *out = (fm_vec3_t){{0.0f, 0.0f, 1.0f}};
+        return false;
+    }
+    *out = (fm_vec3_t){{nx, ny, sqrtf(1.0f - rr)}};
+    return true;
+}
+
+static inline uint16_t quantize_u88_sat(float v)
+{
+    if (v <= 0.0f) return U88_ZERO;
+    float s = v * (float)U88_ONE + 0.5f;
+    if (s >= (float)U88_MAX) return U88_MAX;
+    return (uint16_t)s;
+}
+
+static inline float fresnel_schlick(float ndotv, float f0)
+{
+    ndotv = clampf_local(ndotv, 0.0f, 1.0f);
+    float x = 1.0f - ndotv;
+    float x2 = x * x;
+    float x4 = x2 * x2;
+    float x5 = x4 * x;
+    return f0 + (1.0f - f0) * x5;
+}
+
+static void init_fresnel_masks(float f0)
+{
+    if (g_fresnel_masks_init) return;
 
     for (int y = 0; y < MATCAP_SIZE; y++) {
         for (int x = 0; x < MATCAP_SIZE; x++) {
-            int idx = y * MATCAP_SIZE + x;
-            float nx = ((float)x + 0.5f) * INV_MATCAP_SIZE * 2.0f - 1.0f;
-            float ny = 1.0f - (((float)y + 0.5f) * INV_MATCAP_SIZE * 2.0f);
-            float rr = nx * nx + ny * ny;
+            size_t idx = (size_t)y * (size_t)MATCAP_SIZE + (size_t)x;
 
-            if (rr > 1.0f) {
-                g_texel_cache[idx].valid = false;
-                g_texel_cache[idx].n = (fm_vec3_t){{0.0f, 0.0f, 1.0f}};
-            } else {
-                g_texel_cache[idx].valid = true;
-                g_texel_cache[idx].n = (fm_vec3_t){{nx, ny, sqrtf(1.0f - rr)}};
+            fm_vec3_t forward_view;
+            bool valid = compute_forward_view(x, y, &forward_view);
+            if (!valid) {
+                g_fresnel_mask_f32[idx] = 0.0f;
+                g_fresnel_mask_u88[idx] = 0;
+                continue;
             }
+
+            float fres = fresnel_schlick(forward_view.z, f0);
+            g_fresnel_mask_f32[idx] = fres;
+            g_fresnel_mask_u88[idx] = (uint16_t)(fres * (float)U88_ONE + 0.5f);
         }
     }
 
-    g_texel_cache_init = true;
+    g_fresnel_masks_init = true;
 }
 
 void build_camera_from_yaw(float yaw, CameraState *cam)
@@ -175,148 +188,146 @@ void build_camera_from_yaw(float yaw, CameraState *cam)
     cam->forward[2] = f.z;
 }
 
+// function to evaluate a GGX light
+// returns the vector of light intensity where each component is {roughness0, roughness1, diffuse}
+// N - normal vector
+// V - view vector
+// L - light vector
+// roughness - array of roughness values
+// out - output vector
+static void EvaluateGGX(
+    const fm_vec3_t* N,
+    const fm_vec3_t* V,
+    const fm_vec3_t* L,
+    const float roughness[2],
+    fm_vec3_t* out)
+{
+    out->x = 0.0f;
+    out->y = 0.0f;
+    out->z = 0.0f;
+
+    float NdotV = fm_vec3_dot(N, V);
+    float NdotL = fm_vec3_dot(N, L);
+
+    if (NdotV <= 0.0f || NdotL <= 0.0f) return;
+
+    out->z = NdotL;
+
+    fm_vec3_t H; fm_vec3_add(&H, V, L);
+    float lenH2 = fm_vec3_dot(&H, &H);
+    if (lenH2 <= 1e-8f) return;
+    float invLenH = 1.0f / sqrtf(lenH2);
+    float NdotH = fm_vec3_dot(N, &H) * invLenH;
+    NdotH = clampf_local(NdotH, 0.0f, 1.0f);
+
+    for (int i = 0; i < 2; i++) {
+        float a  = roughness[i] * roughness[i];
+        float a2 = a * a;
+
+        float NdotH2 = NdotH * NdotH;
+        float denom = NdotH2 * (a2 - 1.0f) + 1.0f;
+        float D = a2 / (PI_F * denom * denom);
+
+        // fresnel is handled at RSP postprocess
+        //float oneMinus = 1.0f - VdotH;
+        //float oneMinus2 = oneMinus * oneMinus;
+        //float oneMinus4 = oneMinus2 * oneMinus2;
+        //fm_vec3_t F = F0 + (1.0f - F0) * oneMinus4; // approximated to just 4-th power for one less multiply
+
+        float k = (roughness[i] + 1.0f);
+        k = (k * k) * 0.125f;
+
+        float Gv = NdotV / (NdotV * (1.0f - k) + k);
+        float Gl = NdotL / (NdotL * (1.0f - k) + k);
+        float G = Gv * Gl;
+
+        float brdf = (D * G) / (4.0f * NdotV * NdotL + 1e-6f);
+        float lit = brdf * NdotL; /* final light contribution fades to 0 at grazing NdotL */
+        if (i == 0) out->x = lit;
+        else out->y = lit;
+    }
+}
+
 void generate_matcaps_ggx(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out)
 {
-    init_texel_cache();
-
-    float anchor_rough[4] = {0.12f, 0.22f, 0.52f, 0.75f};
-    float fresnel_lut[MATCAP_SIZE * MATCAP_SIZE];
-    float anchor_spec[4][MATCAP_SIZE * MATCAP_SIZE][3];
-    fm_vec3_t light_dir[4];
-    fm_vec3_t light_H[4];
-    float light_vdoth[4];
-    int light_count = lights->count;
-
-    if (light_count > 4) light_count = 4;
-
-    memset(anchor_spec, 0, sizeof(anchor_spec));
-    memset(fresnel_lut, 0, sizeof(fresnel_lut));
+    init_fresnel_masks(FRESNEL_F0_DEFAULT);
 
     float yaw = fm_atan2f(cam->forward[2], cam->forward[0]);
     float sin_yaw, cos_yaw;
     fm_sincosf(yaw, &sin_yaw, &cos_yaw);
+    const fm_vec3_t V = {{0.0f, 0.0f, 1.0f}};
+    const float roughness[2] = {0.25f, 0.75f};
+    int light_count = lights ? lights->count : 0;
+    if (light_count > 4) light_count = 4;
 
-    for (int li = 0; li < light_count; li++) {
-        light_dir[li] = (fm_vec3_t){{lights->dir[li][0], lights->dir[li][1], lights->dir[li][2]}};
-        fm_vec3_norm(&light_dir[li], &light_dir[li]);
+    for (int y = 0; y < MATCAP_SIZE; y++) {
+        for (int x = 0; x < MATCAP_SIZE; x++) {
+            size_t idx = (size_t)y * (size_t)MATCAP_SIZE + (size_t)x;
 
-        fm_vec3_t view_vec = {{0.0f, 0.0f, 1.0f}};
-        fm_vec3_add(&light_H[li], &light_dir[li], &view_vec);
-        fm_vec3_norm(&light_H[li], &light_H[li]);
-        light_vdoth[li] = clampf_local(light_H[li].z, 0.0f, 1.0f);
-    }
+            /* Shared per-pixel forward vector in view space for custom BRDF code. */
+            fm_vec3_t forward_view;
 
-    for (int idx = 0; idx < MATCAP_SIZE * MATCAP_SIZE; idx++) {
-        if (!g_texel_cache[idx].valid) {
-            set_rgb_const(&out->diffuse[idx], (uint16_t)FIXED_ONE);
-            for (int r = 0; r < 8; r++) {
-                int chain_idx = (r << 10) | idx;
-                set_rgb_const(&out->spec[chain_idx], (uint16_t)FIXED_ONE);
-                set_rgb_const(&out->spec_mod[chain_idx], (uint16_t)FIXED_ONE);
-                set_rgb_const(&out->spec_fres[chain_idx], (uint16_t)FIXED_ONE);
+            bool valid = compute_forward_view(x, y, &forward_view);
+            if (!valid) {
+                set_rgb_const(&out->diffuse[idx], U88_ZERO);
+                set_rgb_const(&out->rough25[idx], U88_ZERO);
+                set_rgb_const(&out->rough75[idx], U88_ZERO);
+                continue;
             }
-            continue;
-        }
 
-        const fm_vec3_t *N = &g_texel_cache[idx].n;
-        float nx = N->x;
-        float ny = N->y;
-        float nz = N->z;
-        float NdotV = nz;
+            fm_vec3_t diffuse_dir_env = forward_view;
+            rotate_y(&diffuse_dir_env, cos_yaw, sin_yaw);
 
-        fm_vec3_t N_env = *N;
-        rotate_y(&N_env, cos_yaw, sin_yaw);
+            fm_vec3_t spec_dir_view = reflect_view_about_normal(&forward_view);
+            fm_vec3_t spec_dir_env = spec_dir_view;
+            rotate_y(&spec_dir_env, cos_yaw, sin_yaw);
 
-        float env_d[3];
-        sample_equirect_nearest(hdri->diffuse_irr ? hdri->diffuse_irr : hdri->rgb, hdri->w, hdri->h, &N_env, env_d);
+            /*
+             * Precomputed Fresnel masks for the current texel:
+             * - float mask for float-domain code
+             * - u8.8 mask for fixed-point multiply
+             */
+            float fresnel_f = g_fresnel_mask_f32[idx];
+            uint16_t fresnel_u88 = g_fresnel_mask_u88[idx];
 
-        float diff[3] = {env_d[0], env_d[1], env_d[2]};
-        float ndotl_lut[4] = {0};
-        float ndoth_lut[4] = {0};
-
-        for (int li = 0; li < light_count; li++) {
-            float ndotl = fm_vec3_dot(N, &light_dir[li]);
-            if (ndotl < 0.0f) ndotl = 0.0f;
-            ndotl_lut[li] = ndotl;
-
-            for (int c = 0; c < 3; c++) diff[c] += lights->color[li][c] * ndotl;
-
-            float ndoth = fm_vec3_dot(N, &light_H[li]);
-            if (ndoth < 0.0f) ndoth = 0.0f;
-            ndoth_lut[li] = ndoth;
-        }
-
-        set_rgb_quantized(&out->diffuse[idx], diff);
-
-        float fres = fresnel_schlick_scalar(NdotV, 0.04f);
-        fresnel_lut[idx] = fres;
-
-        fm_vec3_t R = {{2.0f * NdotV * nx, 2.0f * NdotV * ny, 2.0f * NdotV * NdotV - 1.0f}};
-        rotate_y(&R, cos_yaw, sin_yaw);
-
-        for (int a = 0; a < 4; a++) {
-            float env[3];
-            const float *src = hdri->prefilter[a] ? hdri->prefilter[a] : hdri->rgb;
-            sample_equirect_nearest(src, hdri->w, hdri->h, &R, env);
-
-            float rough = anchor_rough[a];
-            float a2 = rough * rough;
-            float gv = ggx_G1(NdotV, rough);
-            float ggx_sum[3] = {0.0f, 0.0f, 0.0f};
+            /*
+             * Diffuse and specular use different sampling coordinates:
+             * - diffuse: surface normal direction
+             * - specular: reflected view vector
+             */
+            sample_equirect_nearest_u88(hdri->diffuse, hdri->w, hdri->h, &diffuse_dir_env, &out->diffuse[idx]);
+            sample_equirect_nearest_u88(hdri->rough25, hdri->w, hdri->h, &spec_dir_env, &out->rough25[idx]);
+            sample_equirect_nearest_u88(hdri->rough75, hdri->w, hdri->h, &spec_dir_env, &out->rough75[idx]);
 
             for (int li = 0; li < light_count; li++) {
-                float NdotL = ndotl_lut[li];
-                if (NdotL <= 0.0f) continue;
+                fm_vec3_t L = {{
+                    lights->dir[li][0],
+                    lights->dir[li][1],
+                    lights->dir[li][2]
+                }};
+                fm_vec3_norm(&L, &L);
 
-                float NdotH = ndoth_lut[li];
-                float VdotH = light_vdoth[li];
+                fm_vec3_t ggx = {{0.0f, 0.0f, 0.0f}};
+                EvaluateGGX(&forward_view, &V, &L, roughness, &ggx);
+                if (ggx.z <= 0.0f) continue;
 
-                float dd = (NdotH * NdotH) * (a2 - 1.0f) + 1.0f;
-                float D = a2 / (PI_F * dd * dd + 1e-6f);
-                float G = gv * ggx_G1(NdotL, rough);
-                float F = fresnel_schlick_scalar(VdotH, 0.04f);
-                float spec = (D * G * F) / (4.0f * NdotV * NdotL + 1e-6f);
+                float spec25 = ggx.x;
+                float spec75 = ggx.y;
+                float diff_l = ggx.z;
 
-                for (int c = 0; c < 3; c++) ggx_sum[c] += lights->color[li][c] * spec * NdotL;
+                for (int c = 0; c < 3; c++) {
+                    uint16_t d_add = quantize_u88_sat(lights->color[li][c] * diff_l);
+                    uint16_t s25_add = quantize_u88_sat(lights->color[li][c] * spec25);
+                    uint16_t s75_add = quantize_u88_sat(lights->color[li][c] * spec75);
+
+                    out->diffuse[idx].c[c] = u88_add_sat(out->diffuse[idx].c[c], d_add);
+                    out->rough25[idx].c[c] = u88_add_sat(out->rough25[idx].c[c], s25_add);
+                    out->rough75[idx].c[c] = u88_add_sat(out->rough75[idx].c[c], s75_add);
+                }
             }
 
-            for (int c = 0; c < 3; c++) anchor_spec[a][idx][c] = env[c] + ggx_sum[c];
-        }
-    }
-
-    for (int r = 0; r < 8; r++) {
-        float rf = ((float)r / 7.0f) * 3.0f;
-        int i0 = (int)fm_floorf(rf);
-        int i1 = i0 + 1;
-        if (i1 > 3) i1 = 3;
-        float t = rf - (float)i0;
-
-        for (int i = 0; i < MATCAP_SIZE * MATCAP_SIZE; i++) {
-            float s0[3] = {
-                anchor_spec[i0][i][0],
-                anchor_spec[i0][i][1],
-                anchor_spec[i0][i][2]
-            };
-            float s1[3] = {
-                anchor_spec[i1][i][0],
-                anchor_spec[i1][i][1],
-                anchor_spec[i1][i][2]
-            };
-            float s[3] = {
-                s0[0] + (s1[0] - s0[0]) * t,
-                s0[1] + (s1[1] - s0[1]) * t,
-                s0[2] + (s1[2] - s0[2]) * t
-            };
-
-            float fres = fresnel_lut[i];
-            float inv_f = 1.0f - fres;
-            int chain_idx = (r << 10) | i;
-
-            for (int c = 0; c < 3; c++) {
-                out->spec[chain_idx].c[c] = quantize_hdr(s[c]);
-                out->spec_mod[chain_idx].c[c] = quantize_hdr(s[c] * inv_f);
-                out->spec_fres[chain_idx].c[c] = quantize_hdr(s[c] * fres);
-            }
+            (void)fresnel_f;
+            (void)fresnel_u88;
         }
     }
 }

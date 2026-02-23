@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define MATCAP_SIZE 32
+#define MATCAP_SIZE 16
 
 typedef struct {
     /* u8.8 fixed-point RGB channels (1.0 == 256). */
@@ -14,17 +14,16 @@ typedef struct {
     int w;
     int h;
     hdr16_rgb_t *diffuse;
-    hdr16_rgb_t *spec;
-    hdr16_rgb_t *spec_mod;
-    hdr16_rgb_t *spec_fres;
+    hdr16_rgb_t *rough25;
+    hdr16_rgb_t *rough75;
 } MatcapSet;
 
 typedef struct {
     int w;
     int h;
-    float *rgb;
-    float *prefilter[4];
-    float *diffuse_irr;
+    hdr16_rgb_t *diffuse;
+    hdr16_rgb_t *rough25;
+    hdr16_rgb_t *rough75;
 } HDRISet;
 
 typedef struct {
