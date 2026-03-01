@@ -16,12 +16,22 @@
 static float g_fresnel_mask_f32[MATCAP_SIZE * MATCAP_SIZE];
 static uint16_t g_fresnel_mask_u88[MATCAP_SIZE * MATCAP_SIZE];
 static bool g_fresnel_masks_init = false;
+static int g_hdri_sample_w = 0;
+static int g_hdri_sample_h = 0;
 
-static inline void set_rgb_const(hdr16_rgb_t *dst, uint16_t v)
+static inline void set_hdr_const(hdr16_rgb_t *dst, uint16_t v)
 {
     dst->c[0] = v;
     dst->c[1] = v;
     dst->c[2] = v;
+}
+
+static inline void set_matcap_const(matcap_rgba_t *dst, uint8_t rgb, uint8_t a)
+{
+    dst->c[0] = rgb;
+    dst->c[1] = rgb;
+    dst->c[2] = rgb;
+    dst->c[3] = a;
 }
 
 bool alloc_matcaps(MatcapSet *m)
@@ -31,9 +41,9 @@ bool alloc_matcaps(MatcapSet *m)
     m->h = MATCAP_SIZE;
 
     size_t texels = (size_t)m->w * (size_t)m->h;
-    m->diffuse = malloc(sizeof(hdr16_rgb_t) * texels);
-    m->rough25 = malloc(sizeof(hdr16_rgb_t) * texels);
-    m->rough75 = malloc(sizeof(hdr16_rgb_t) * texels);
+    m->diffuse = malloc(sizeof(matcap_rgba_t) * texels);
+    m->rough25 = malloc(sizeof(matcap_rgba_t) * texels);
+    m->rough75 = malloc(sizeof(matcap_rgba_t) * texels);
 
     if (!m->diffuse || !m->rough25 || !m->rough75) {
         free_matcaps(m);
@@ -87,20 +97,22 @@ static inline float fast_acosf(float x)
     return res;
 }
 
-static inline void sample_equirect_nearest_u88(const hdr16_rgb_t *img, int w, int h, const fm_vec3_t *dir, hdr16_rgb_t *out_rgb)
+static inline void dir_to_equirect_uv(const fm_vec3_t *dir, float *u, float *v)
 {
-    if (!img || w <= 0 || h <= 0) {
-        set_rgb_const(out_rgb, U88_ONE);
+    *u = fm_atan2f(dir->z, dir->x) * HALF_INV_PI_F + 0.5f;
+    *v = fast_acosf(dir->y) * INV_PI_F;
+}
+
+static inline void sample_equirect_nearest_u88(const hdr16_rgb_t *img, float u, float v, hdr16_rgb_t *out_rgb)
+{
+    if (!img || g_hdri_sample_w <= 0 || g_hdri_sample_h <= 0) {
+        set_hdr_const(out_rgb, U88_ONE);
         return;
     }
 
-    float u = fm_atan2f(dir->z, dir->x) * HALF_INV_PI_F + 0.5f;
-    float v = fast_acosf(dir->y) * INV_PI_F;
-
-    int ix = wrap_x((int)(u * (float)w), w);
-    int iy = clamp_y((int)(v * (float)h), h);
-
-    *out_rgb = img[(size_t)iy * (size_t)w + (size_t)ix];
+    int ix = wrap_x((int)(u * (float)g_hdri_sample_w), g_hdri_sample_w);
+    int iy = clamp_y((int)(v * (float)g_hdri_sample_h), g_hdri_sample_h);
+    *out_rgb = img[(size_t)iy * (size_t)g_hdri_sample_w + (size_t)ix];
 }
 
 static inline void rotate_y(fm_vec3_t *v, float cos_a, float sin_a)
@@ -113,7 +125,6 @@ static inline void rotate_y(fm_vec3_t *v, float cos_a, float sin_a)
 
 static inline fm_vec3_t reflect_view_about_normal(const fm_vec3_t *n_view)
 {
-    /* R = reflect(-V, N), with V=(0,0,1) in view space. */
     float ndotv = n_view->z;
     fm_vec3_t r = {{
         2.0f * ndotv * n_view->x,
@@ -142,6 +153,19 @@ static inline uint16_t quantize_u88_sat(float v)
     float s = v * (float)U88_ONE + 0.5f;
     if (s >= (float)U88_MAX) return U88_MAX;
     return (uint16_t)s;
+}
+
+static inline uint8_t u88_to_u26_sat(uint16_t v)
+{
+    uint16_t q = (uint16_t)((v + 2u) >> 2);
+    if (q > 255u) q = 255u;
+    return (uint8_t)q;
+}
+
+static inline uint8_t u88_to_u08_sat(uint16_t v)
+{
+    if (v >= U88_ONE) return 255u;
+    return (uint8_t)((((uint32_t)v * 255u) + 128u) >> 8);
 }
 
 static inline float fresnel_schlick(float ndotv, float f0)
@@ -188,19 +212,14 @@ void build_camera_from_yaw(float yaw, CameraState *cam)
     cam->forward[2] = f.z;
 }
 
-// function to evaluate a GGX light
+// function to evaluate a GGX light intensity
 // returns the vector of light intensity where each component is {roughness0, roughness1, diffuse}
 // N - normal vector
 // V - view vector
 // L - light vector
 // roughness - array of roughness values
 // out - output vector
-static void EvaluateGGX(
-    const fm_vec3_t* N,
-    const fm_vec3_t* V,
-    const fm_vec3_t* L,
-    const float roughness[2],
-    fm_vec3_t* out)
+static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t *L, const float roughness[2], fm_vec3_t *out)
 {
     out->x = 0.0f;
     out->y = 0.0f;
@@ -208,33 +227,26 @@ static void EvaluateGGX(
 
     float NdotV = fm_vec3_dot(N, V);
     float NdotL = fm_vec3_dot(N, L);
-
     if (NdotV <= 0.0f || NdotL <= 0.0f) return;
 
     out->z = NdotL;
 
-    fm_vec3_t H; fm_vec3_add(&H, V, L);
+    fm_vec3_t H;
+    fm_vec3_add(&H, V, L);
     float lenH2 = fm_vec3_dot(&H, &H);
     if (lenH2 <= 1e-8f) return;
+
     float invLenH = 1.0f / sqrtf(lenH2);
-    float NdotH = fm_vec3_dot(N, &H) * invLenH;
-    NdotH = clampf_local(NdotH, 0.0f, 1.0f);
+    float NdotH = clampf_local(fm_vec3_dot(N, &H) * invLenH, 0.0f, 1.0f);
 
     for (int i = 0; i < 2; i++) {
-        float a  = roughness[i] * roughness[i];
+        float a = roughness[i] * roughness[i];
         float a2 = a * a;
-
         float NdotH2 = NdotH * NdotH;
         float denom = NdotH2 * (a2 - 1.0f) + 1.0f;
-        float D = a2 / (PI_F * denom * denom);
+        float D = a2 / (PI_F * denom * denom + 1e-6f);
 
-        // fresnel is handled at RSP postprocess
-        //float oneMinus = 1.0f - VdotH;
-        //float oneMinus2 = oneMinus * oneMinus;
-        //float oneMinus4 = oneMinus2 * oneMinus2;
-        //fm_vec3_t F = F0 + (1.0f - F0) * oneMinus4; // approximated to just 4-th power for one less multiply
-
-        float k = (roughness[i] + 1.0f);
+        float k = roughness[i] + 1.0f;
         k = (k * k) * 0.125f;
 
         float Gv = NdotV / (NdotV * (1.0f - k) + k);
@@ -242,19 +254,22 @@ static void EvaluateGGX(
         float G = Gv * Gl;
 
         float brdf = (D * G) / (4.0f * NdotV * NdotL + 1e-6f);
-        float lit = brdf * NdotL; /* final light contribution fades to 0 at grazing NdotL */
+        float lit = brdf * NdotL;
         if (i == 0) out->x = lit;
         else out->y = lit;
     }
 }
 
-void generate_matcaps_ggx(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out)
+void generate_matcaps(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out)
 {
     init_fresnel_masks(FRESNEL_F0_DEFAULT);
+    g_hdri_sample_w = hdri ? hdri->w : 0;
+    g_hdri_sample_h = hdri ? hdri->h : 0;
 
     float yaw = fm_atan2f(cam->forward[2], cam->forward[0]);
     float sin_yaw, cos_yaw;
     fm_sincosf(yaw, &sin_yaw, &cos_yaw);
+
     const fm_vec3_t V = {{0.0f, 0.0f, 1.0f}};
     const float roughness[2] = {0.25f, 0.75f};
     int light_count = lights ? lights->count : 0;
@@ -264,14 +279,11 @@ void generate_matcaps_ggx(const CameraState *cam, const LightingState *lights, c
         for (int x = 0; x < MATCAP_SIZE; x++) {
             size_t idx = (size_t)y * (size_t)MATCAP_SIZE + (size_t)x;
 
-            /* Shared per-pixel forward vector in view space for custom BRDF code. */
             fm_vec3_t forward_view;
-
-            bool valid = compute_forward_view(x, y, &forward_view);
-            if (!valid) {
-                set_rgb_const(&out->diffuse[idx], U88_ZERO);
-                set_rgb_const(&out->rough25[idx], U88_ZERO);
-                set_rgb_const(&out->rough75[idx], U88_ZERO);
+            if (!compute_forward_view(x, y, &forward_view)) {
+                set_matcap_const(&out->diffuse[idx], 0u, 0u);
+                set_matcap_const(&out->rough25[idx], 0u, 0u);
+                set_matcap_const(&out->rough75[idx], 0u, 0u);
                 continue;
             }
 
@@ -282,22 +294,21 @@ void generate_matcaps_ggx(const CameraState *cam, const LightingState *lights, c
             fm_vec3_t spec_dir_env = spec_dir_view;
             rotate_y(&spec_dir_env, cos_yaw, sin_yaw);
 
-            /*
-             * Precomputed Fresnel masks for the current texel:
-             * - float mask for float-domain code
-             * - u8.8 mask for fixed-point multiply
-             */
-            float fresnel_f = g_fresnel_mask_f32[idx];
-            uint16_t fresnel_u88 = g_fresnel_mask_u88[idx];
+            float u_diff, v_diff;
+            float u_spec, v_spec;
+            dir_to_equirect_uv(&diffuse_dir_env, &u_diff, &v_diff);
+            dir_to_equirect_uv(&spec_dir_env, &u_spec, &v_spec);
 
-            /*
-             * Diffuse and specular use different sampling coordinates:
-             * - diffuse: surface normal direction
-             * - specular: reflected view vector
-             */
-            sample_equirect_nearest_u88(hdri->diffuse, hdri->w, hdri->h, &diffuse_dir_env, &out->diffuse[idx]);
-            sample_equirect_nearest_u88(hdri->rough25, hdri->w, hdri->h, &spec_dir_env, &out->rough25[idx]);
-            sample_equirect_nearest_u88(hdri->rough75, hdri->w, hdri->h, &spec_dir_env, &out->rough75[idx]);
+            hdr16_rgb_t env_diff;
+            hdr16_rgb_t env_s25;
+            hdr16_rgb_t env_s75;
+            sample_equirect_nearest_u88(hdri->diffuse, u_diff, v_diff, &env_diff);
+            sample_equirect_nearest_u88(hdri->rough25, u_spec, v_spec, &env_s25);
+            sample_equirect_nearest_u88(hdri->rough75, u_spec, v_spec, &env_s75);
+
+            uint16_t diff_acc[3] = {env_diff.c[0], env_diff.c[1], env_diff.c[2]};
+            uint16_t s25_acc[3] = {env_s25.c[0], env_s25.c[1], env_s25.c[2]};
+            uint16_t s75_acc[3] = {env_s75.c[0], env_s75.c[1], env_s75.c[2]};
 
             for (int li = 0; li < light_count; li++) {
                 fm_vec3_t L = {{
@@ -305,29 +316,33 @@ void generate_matcaps_ggx(const CameraState *cam, const LightingState *lights, c
                     lights->dir[li][1],
                     lights->dir[li][2]
                 }};
-                fm_vec3_norm(&L, &L);
 
-                fm_vec3_t ggx = {{0.0f, 0.0f, 0.0f}};
+                fm_vec3_t ggx;
                 EvaluateGGX(&forward_view, &V, &L, roughness, &ggx);
                 if (ggx.z <= 0.0f) continue;
 
-                float spec25 = ggx.x;
-                float spec75 = ggx.y;
-                float diff_l = ggx.z;
-
                 for (int c = 0; c < 3; c++) {
-                    uint16_t d_add = quantize_u88_sat(lights->color[li][c] * diff_l);
-                    uint16_t s25_add = quantize_u88_sat(lights->color[li][c] * spec25);
-                    uint16_t s75_add = quantize_u88_sat(lights->color[li][c] * spec75);
-
-                    out->diffuse[idx].c[c] = u88_add_sat(out->diffuse[idx].c[c], d_add);
-                    out->rough25[idx].c[c] = u88_add_sat(out->rough25[idx].c[c], s25_add);
-                    out->rough75[idx].c[c] = u88_add_sat(out->rough75[idx].c[c], s75_add);
+                    uint16_t d_add = quantize_u88_sat(lights->color[li][c] * ggx.z);
+                    uint16_t s25_add = quantize_u88_sat(lights->color[li][c] * ggx.x);
+                    uint16_t s75_add = quantize_u88_sat(lights->color[li][c] * ggx.y);
+                    diff_acc[c] = u88_add_sat(diff_acc[c], d_add);
+                    s25_acc[c] = u88_add_sat(s25_acc[c], s25_add);
+                    s75_acc[c] = u88_add_sat(s75_acc[c], s75_add);
                 }
             }
 
-            (void)fresnel_f;
-            (void)fresnel_u88;
+            uint16_t fres_u88 = g_fresnel_mask_u88[idx];
+            uint8_t alpha_spec = u88_to_u08_sat(fres_u88);
+            uint8_t alpha_diff = u88_to_u08_sat(u88_sub_sat(U88_ONE, fres_u88));
+
+            for (int c = 0; c < 3; c++) {
+                out->diffuse[idx].c[c] = u88_to_u26_sat(diff_acc[c]);
+                out->rough25[idx].c[c] = u88_to_u26_sat(s25_acc[c]);
+                out->rough75[idx].c[c] = u88_to_u26_sat(s75_acc[c]);
+            }
+            out->diffuse[idx].c[3] = alpha_diff;
+            out->rough25[idx].c[3] = alpha_spec;
+            out->rough75[idx].c[3] = alpha_spec;
         }
     }
 }

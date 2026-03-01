@@ -28,7 +28,7 @@ static inline uint16_t u88_sub_sat(uint16_t a, uint16_t b)
 static inline uint16_t u88_mul(uint16_t a, uint16_t b)
 {
     uint32_t v = ((uint32_t)a * (uint32_t)b + U88_HALF) >> 8;
-    return u88_clamp_u32(v);
+    return (v);
 }
 
 static inline uint16_t u88_lerp(uint16_t a, uint16_t b, uint16_t t)

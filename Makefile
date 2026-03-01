@@ -18,6 +18,8 @@ SRCS = $(shell find $(SOURCE_DIR)/ -type f -name '*.c') \
 		$(shell find $(SOURCE_DIR)/$(GAME_SOURCE_DIR)/ -type f -name '*.c') \
 	    $(shell find $(SOURCE_DIR)/$(GAME_SOURCE_DIR)/ -type f -name '*.cpp')
 
+ASM = $(SOURCE_DIR)/rsp_pbr_blend.S
+
 IMAGE_LIST = $(shell find $(ASSETS_DIR)/models/ -type f -name '*.png') \
 			 $(shell find $(ASSETS_DIR)/textures/ -type f -name '*.png')
 FONT_LIST  = $(shell find $(ASSETS_DIR)/fonts/ -type f -name '*.ttf')
@@ -39,7 +41,7 @@ ASSETS_LIST += $(subst $(ASSETS_DIR),$(FILESYSTEM_DIR),$(MOVIES_LIST))
 ASSETS_LIST += $(subst $(ASSETS_DIR),$(FILESYSTEM_DIR),$(PBM_LIST))
 
 N64_CFLAGS += -std=gnu2x
-N64_C_AND_CXX_FLAGS += -I $(SOURCE_DIR) -I $(SOURCE_DIR)/$(GAME_SOURCE_DIR) -ftrivial-auto-var-init=zero
+N64_C_AND_CXX_FLAGS += -I $(SOURCE_DIR) -I $(SOURCE_DIR)/$(GAME_SOURCE_DIR) -O3 -ftrivial-auto-var-init=zero
 
 all: $(NAME).z64
 
@@ -95,7 +97,7 @@ $(FILESYSTEM_DIR)/textures/%.pbm: $(ASSETS_DIR)/textures/%.pbm
 	$(N64_BINDIR)/mkasset -c 0 -o $(dir $@) "$<"
 
 $(BUILD_DIR)/$(NAME).dfs: $(ASSETS_LIST)
-$(BUILD_DIR)/$(NAME).elf: $(SRCS:$(SOURCE_DIR)/%.c=$(BUILD_DIR)/%.o) $(SRCS:$(SOURCE_DIR)/%.cpp=$(BUILD_DIR)/%.o) $(SRCS:$(SOURCE_DIR)/$(GAME_SOURCE_DIR)/%.c=$(BUILD_DIR)/$(GAME_SOURCE_DIR)/%.o) $(SRCS:$(SOURCE_DIR)/$(GAME_SOURCE_DIR)/%.cpp=$(BUILD_DIR)/$(GAME_SOURCE_DIR)/%.o)
+$(BUILD_DIR)/$(NAME).elf: $(SRCS:$(SOURCE_DIR)/%.c=$(BUILD_DIR)/%.o) $(SRCS:$(SOURCE_DIR)/%.cpp=$(BUILD_DIR)/%.o)  $(ASM:$(SOURCE_DIR)/%.S=$(BUILD_DIR)/%.o) $(SRCS:$(SOURCE_DIR)/$(GAME_SOURCE_DIR)/%.c=$(BUILD_DIR)/$(GAME_SOURCE_DIR)/%.o) $(SRCS:$(SOURCE_DIR)/$(GAME_SOURCE_DIR)/%.cpp=$(BUILD_DIR)/$(GAME_SOURCE_DIR)/%.o)
 
 $(NAME).z64: N64_ROM_TITLE=$(ROM_NAME)
 $(NAME).z64: $(BUILD_DIR)/$(NAME).dfs

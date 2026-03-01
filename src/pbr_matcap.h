@@ -7,6 +7,6 @@
 bool alloc_matcaps(MatcapSet *m);
 void free_matcaps(MatcapSet *m);
 void build_camera_from_yaw(float yaw, CameraState *cam);
-void generate_matcaps_ggx(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out);
+void generate_matcaps(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out);
 
 #endif
