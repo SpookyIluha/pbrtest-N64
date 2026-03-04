@@ -19,7 +19,32 @@ enum {
     // Overlay commands. This must match the command table in the RSP code
     RSP_PBR_BLEND_CMD_SET_GBUFFER = 0x0,
     RSP_PBR_BLEND_CMD_SET_LIGHTINGBUFFERS = 0x1,
-    RSP_PBR_BLEND_CMD_POSTPROCESS = 0x2
+    RSP_PBR_BLEND_CMD_SET_DITHER_MATRIX = 0x2,
+    RSP_PBR_BLEND_CMD_POSTPROCESS = 0x3
+};
+
+#define DITHER_MULTIPLIER 64
+
+static const uint16_t bayer8x2_dither_signed[16] = {
+    // Row 0
+    (uint16_t)(( 5) * DITHER_MULTIPLIER),
+    (uint16_t)((12) * DITHER_MULTIPLIER),
+    (uint16_t)(( 3) * DITHER_MULTIPLIER),
+    (uint16_t)((10) * DITHER_MULTIPLIER),
+    (uint16_t)((4) * DITHER_MULTIPLIER),
+    (uint16_t)((9) * DITHER_MULTIPLIER),
+    (uint16_t)((11) * DITHER_MULTIPLIER),
+    (uint16_t)((14) * DITHER_MULTIPLIER),
+
+    // Row 1
+    (uint16_t)((11) * DITHER_MULTIPLIER),
+    (uint16_t)((3) * DITHER_MULTIPLIER),
+    (uint16_t)((15) * DITHER_MULTIPLIER),
+    (uint16_t)((8) * DITHER_MULTIPLIER),
+    (uint16_t)((12) * DITHER_MULTIPLIER),
+    (uint16_t)((8) * DITHER_MULTIPLIER),
+    (uint16_t)((13) * DITHER_MULTIPLIER),
+    (uint16_t)((9) * DITHER_MULTIPLIER),
 };
 
 // Overlay definition
@@ -41,10 +66,11 @@ void rsp_pbr_blend_assert_handler(rsp_snapshot_t *state, uint16_t code) {
             state->gpr[8]); // read current width from t0 (reg #8): we know it's there at assert point
         return;
     }
+    assertf(0, "PBR Blend crashed with code %i", code);
 }
 
 void rsp_pbr_blend_set_gbuffer(const surface_t *albedo, const surface_t *packed, const surface_t* destination) {
-    assert(albedo && packed);
+    assert(albedo && packed && destination);
     assertf(surface_get_format(albedo) == FMT_RGBA16 
     && surface_get_format(packed) == FMT_RGBA16 
     && surface_get_format(destination) == FMT_RGBA16,
@@ -59,15 +85,17 @@ void rsp_pbr_blend_set_gbuffer(const surface_t *albedo, const surface_t *packed,
         PhysicalAddr(destination->buffer), (uint32_t)(pixels / 96));
 }
 
-void rsp_pbr_blend_set_lighting_buffers(const surface_t *diffuse, const surface_t *rough25, const surface_t *rough75) {
-    assertf(diffuse != NULL, "Nullptr Diffuse buffer");
-    assertf(rough25 != NULL, "Nullptr Rough25 buffer");
-    assertf(rough75 != NULL, "Nullptr Rough75 buffer");
+void rsp_pbr_blend_set_lighting_buffer(const surface_t *lighting) {
+    assertf(lighting != NULL, "Nullptr Lighting buffer");
+    assertf(surface_get_format(lighting) == FMT_RGBA32, "rsp_pbr_blend lighting buffers must be RGBA32");
 
     rspq_write(ovl_id, RSP_PBR_BLEND_CMD_SET_LIGHTINGBUFFERS, 
-        PhysicalAddr(diffuse), 
-        PhysicalAddr(rough25), 
-        PhysicalAddr(rough75));
+        PhysicalAddr(lighting->buffer));
+}
+
+void rsp_pbr_blend_set_dither_matrix() {
+    rspq_write(ovl_id, RSP_PBR_BLEND_CMD_SET_DITHER_MATRIX, 
+        PhysicalAddr(bayer8x2_dither_signed), 0);
 }
 
 void rsp_pbr_blend_postprocess() {

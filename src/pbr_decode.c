@@ -1,6 +1,7 @@
 #include <libdragon.h>
 
 #include <stdint.h>
+#include <string.h>
 
 #include "pbr_decode.h"
 #include "pbr_u88.h"
@@ -181,6 +182,27 @@ void decode_deferred_cpu(const uint16_t *packed16,
 
 #define CACHE_OP_DIRTY ((0x3 << 2) | 0x1)
 #define CACHE_OP_FLUSH ((0x5 << 2) | 0x1)
+
+static inline uint16_t packed_to_matcap_byte_index(const uint16_t p)
+{
+    // Packed layout: RRRRRXXXXXYYYY0M
+    // Transposed matcap: normal.x(5) -> Y, normal.y(4) -> X
+    if(p & 0b11110'00000'00000'0) {
+        return p & 0b00000'11111'11110'0; // 00000YYYYYXXXX00
+    }
+    return 0;
+}
+
+static inline uint32_t load_matcap_u32(const uint8_t *base, const uint16_t byte_index)
+{
+    return *(const uint32_t *)&base[byte_index];
+}
+
+static inline void copy_16bytes(void *dst, const void *src)
+{
+    memcpy(dst, src, 16);
+}
+
 void decode_packed_cpu(const uint16_t *packed16,
                           uint32_t *out_diffuse,
                           uint32_t *out_rough25,
@@ -189,15 +211,15 @@ void decode_packed_cpu(const uint16_t *packed16,
                           int h,
                           const MatcapSet *mats)
 {
-    register size_t n = (size_t)w * (size_t)h;
+    size_t n = (size_t)w * (size_t)h;
 
     // treat the matcaps as if they were 8-bit so we don't need to do a srl >> 2 in a loop
-    register uint8_t *matcap_diffuse = (uint8_t *)mats->diffuse;
-    register uint8_t *matcap_rough25 = (uint8_t *)mats->rough25;
-    register uint8_t *matcap_rough75 = (uint8_t *)mats->rough75;
-    // matcaps are 16x32 transposed(!) so it's faster to decode them, 
-    // but the actual normals encoded in the packed buffer should be RRRRRXXXXXYYYY0M
-    // and the matcaps themselves should be generated with normals swapped as well
+    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
+    const uint8_t *matcap_rough25 = (const uint8_t *)mats->rough25;
+    const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
+    // Matcaps are stored as 16x32 transposed:
+    // packed normal.x (5-bit) -> matcap Y, packed normal.y (4-bit) -> matcap X.
+    // Packed layout here is: RRRRRXXXXXYYYY0M.
 
     // try to precache the matcaps into CPU's cache:
     // 16x32 matcaps are 6KB which still fits into CPU's cache
@@ -217,7 +239,7 @@ void decode_packed_cpu(const uint16_t *packed16,
     // and just let it access linear buffers, and that's the fastest way to do it
 
     for (register size_t i = 0; i < n; i++) {
-        const register uint16_t p = packed16[i]; // RRRRRYYYYYXXXX0M
+        const register uint16_t p = packed16[i]; // RRRRRXXXXXYYYY0M
         register uint16_t index = 0;
 
         // The emission 'bit' works like this: if roughness is set to 0, then use index = 0,
@@ -238,11 +260,109 @@ void decode_packed_cpu(const uint16_t *packed16,
             asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" (&out_rough75[i]));
         }*/
 
-        out_diffuse[i] = *(uint32_t*)&matcap_diffuse[index];
-        out_rough25[i] = *(uint32_t*)&matcap_rough25[index];
-        out_rough75[i] = *(uint32_t*)&matcap_rough75[index];
+        out_diffuse[i] = load_matcap_u32(matcap_diffuse, index);
+        out_rough25[i] = load_matcap_u32(matcap_rough25, index);
+        out_rough75[i] = load_matcap_u32(matcap_rough75, index);
     }
     //assert(!packed16);
+}
+
+void decode_packed_cpu_interleaved8(const uint16_t *albedo16,
+                                    const uint16_t *packed16,
+                                    uint8_t *out_interleaved,
+                                    int w,
+                                    int h,
+                                    const MatcapSet *mats)
+{
+    const size_t n = (size_t)w * (size_t)h;
+    assertf((n % DECODE_INTERLEAVED8_PIXELS) == 0,
+            "decode_packed_cpu_interleaved8: pixel count must be multiple of 8");
+
+    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
+    const uint8_t *matcap_rough25 = (const uint8_t *)mats->rough25;
+    const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
+
+    const uint16_t *a_ptr = albedo16;
+    const uint16_t *p_ptr = packed16;
+    uint8_t *dst = out_interleaved;
+    size_t blocks = n / DECODE_INTERLEAVED8_PIXELS;
+
+    while (blocks--) {
+        copy_16bytes(dst + DECODE_INTERLEAVED8_OFF_ALBEDO, a_ptr);
+        copy_16bytes(dst + DECODE_INTERLEAVED8_OFF_PACKED, p_ptr);
+
+        uint32_t *out_diff = (uint32_t *)(dst + DECODE_INTERLEAVED8_OFF_DIFFUSE);
+        uint32_t *out_r25 = (uint32_t *)(dst + DECODE_INTERLEAVED8_OFF_ROUGH25);
+        uint32_t *out_r75 = (uint32_t *)(dst + DECODE_INTERLEAVED8_OFF_ROUGH75);
+
+        #define DECODE_STORE_1(px) do { \
+            const uint16_t idx = packed_to_matcap_byte_index(p_ptr[(px)]); \
+            out_diff[(px)] = load_matcap_u32(matcap_diffuse, idx); \
+            out_r25[(px)] = load_matcap_u32(matcap_rough25, idx); \
+            out_r75[(px)] = load_matcap_u32(matcap_rough75, idx); \
+        } while (0)
+
+        DECODE_STORE_1(0);
+        DECODE_STORE_1(1);
+        DECODE_STORE_1(2);
+        DECODE_STORE_1(3);
+        DECODE_STORE_1(4);
+        DECODE_STORE_1(5);
+        DECODE_STORE_1(6);
+        DECODE_STORE_1(7);
+
+        #undef DECODE_STORE_1
+
+        a_ptr += DECODE_INTERLEAVED8_PIXELS;
+        p_ptr += DECODE_INTERLEAVED8_PIXELS;
+        dst += DECODE_INTERLEAVED8_BLOCK_BYTES;
+    }
+}
+
+void decode_packed_cpu_lighting_interleaved8(const uint16_t *packed16,
+                                             uint8_t *out_lighting_interleaved,
+                                             int w,
+                                             int h,
+                                             const MatcapSet *mats)
+{
+    const size_t n = (size_t)w * (size_t)h;
+    assertf((n % DECODE_INTERLEAVED8_PIXELS) == 0,
+            "decode_packed_cpu_lighting_interleaved8: pixel count must be multiple of 8");
+
+    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
+    const uint8_t *matcap_rough25 = (const uint8_t *)mats->rough25;
+    const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
+
+    const uint16_t *p_ptr = packed16;
+    uint8_t *dst = out_lighting_interleaved;
+    size_t blocks = n / DECODE_INTERLEAVED8_PIXELS;
+
+    while (blocks--) {
+        uint32_t *out_diff = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_DIFFUSE);
+        uint32_t *out_r25 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH25);
+        uint32_t *out_r75 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH75);
+
+        #define DECODE_LIGHTING_STORE_1(px) do { \
+            const uint16_t idx = packed_to_matcap_byte_index(p_ptr[(px)]); \
+            out_diff[(px)] = load_matcap_u32(matcap_diffuse, idx); \
+            out_r25[(px)] = load_matcap_u32(matcap_rough25, idx); \
+            out_r75[(px)] = load_matcap_u32(matcap_rough75, idx); \
+        } while (0)
+
+        DECODE_LIGHTING_STORE_1(0);
+        DECODE_LIGHTING_STORE_1(1);
+        DECODE_LIGHTING_STORE_1(2);
+        DECODE_LIGHTING_STORE_1(3);
+        DECODE_LIGHTING_STORE_1(4);
+        DECODE_LIGHTING_STORE_1(5);
+        DECODE_LIGHTING_STORE_1(6);
+        DECODE_LIGHTING_STORE_1(7);
+
+        #undef DECODE_LIGHTING_STORE_1
+
+        p_ptr += DECODE_INTERLEAVED8_PIXELS;
+        dst += DECODE_LIGHTING_INTERLEAVED8_BLOCK_BYTES;
+    }
 }
 
 /*

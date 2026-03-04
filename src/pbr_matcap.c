@@ -11,10 +11,11 @@
 #define INV_PI_F (1.0f / PI_F)
 #define HALF_INV_PI_F (0.5f / PI_F)
 #define FRESNEL_F0_DEFAULT 0.04f
-#define INV_MATCAP_SIZE (1.0f / (float)MATCAP_SIZE)
+#define INV_MATCAP_W (1.0f / (float)MATCAP_W)
+#define INV_MATCAP_H (1.0f / (float)MATCAP_H)
 
-static float g_fresnel_mask_f32[MATCAP_SIZE * MATCAP_SIZE];
-static uint16_t g_fresnel_mask_u88[MATCAP_SIZE * MATCAP_SIZE];
+static float g_fresnel_mask_f32[MATCAP_TEXELS];
+static uint16_t g_fresnel_mask_u88[MATCAP_TEXELS];
 static bool g_fresnel_masks_init = false;
 static int g_hdri_sample_w = 0;
 static int g_hdri_sample_h = 0;
@@ -37,8 +38,8 @@ static inline void set_matcap_const(matcap_rgba_t *dst, uint8_t rgb, uint8_t a)
 bool alloc_matcaps(MatcapSet *m)
 {
     memset(m, 0, sizeof(*m));
-    m->w = MATCAP_SIZE;
-    m->h = MATCAP_SIZE;
+    m->w = MATCAP_W;
+    m->h = MATCAP_H;
 
     size_t texels = (size_t)m->w * (size_t)m->h;
     m->diffuse = malloc(sizeof(matcap_rgba_t) * texels);
@@ -136,8 +137,9 @@ static inline fm_vec3_t reflect_view_about_normal(const fm_vec3_t *n_view)
 
 static inline bool compute_forward_view(int x, int y, fm_vec3_t *out)
 {
-    float nx = ((float)x + 0.5f) * INV_MATCAP_SIZE * 2.0f - 1.0f;
-    float ny = 1.0f - (((float)y + 0.5f) * INV_MATCAP_SIZE * 2.0f);
+    // Transposed matcap layout (16x32): normal.y maps to texel X, normal.x maps to texel Y.
+    float nx = ((float)y + 0.5f) * INV_MATCAP_H * 2.0f - 1.0f;
+    float ny = 1.0f - (((float)x + 0.5f) * INV_MATCAP_W * 2.0f);
     float rr = nx * nx + ny * ny;
     if (rr > 1.0f) {
         *out = (fm_vec3_t){{0.0f, 0.0f, 1.0f}};
@@ -168,23 +170,13 @@ static inline uint8_t u88_to_u08_sat(uint16_t v)
     return (uint8_t)((((uint32_t)v * 255u) + 128u) >> 8);
 }
 
-static inline float fresnel_schlick(float ndotv, float f0)
-{
-    ndotv = clampf_local(ndotv, 0.0f, 1.0f);
-    float x = 1.0f - ndotv;
-    float x2 = x * x;
-    float x4 = x2 * x2;
-    float x5 = x4 * x;
-    return f0 + (1.0f - f0) * x5;
-}
-
 static void init_fresnel_masks(float f0)
 {
     if (g_fresnel_masks_init) return;
 
-    for (int y = 0; y < MATCAP_SIZE; y++) {
-        for (int x = 0; x < MATCAP_SIZE; x++) {
-            size_t idx = (size_t)y * (size_t)MATCAP_SIZE + (size_t)x;
+    for (int y = 0; y < MATCAP_H; y++) {
+        for (int x = 0; x < MATCAP_W; x++) {
+            size_t idx = (size_t)y * (size_t)MATCAP_W + (size_t)x;
 
             fm_vec3_t forward_view;
             bool valid = compute_forward_view(x, y, &forward_view);
@@ -194,7 +186,12 @@ static void init_fresnel_masks(float f0)
                 continue;
             }
 
-            float fres = fresnel_schlick(forward_view.z, f0);
+            float x = sqrtf((forward_view.x * forward_view.x) + (forward_view.y * forward_view.y));
+            x = clampf_local(x, 0.0f, 1.0f);
+            float x2 = x * x;
+            float x4 = x2 * x2;
+            float x5 = x4 * x;
+            float fres = f0 + (1.0f - f0) * x5;
             g_fresnel_mask_f32[idx] = fres;
             g_fresnel_mask_u88[idx] = (uint16_t)(fres * (float)U88_ONE + 0.5f);
         }
@@ -275,15 +272,43 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
     int light_count = lights ? lights->count : 0;
     if (light_count > 4) light_count = 4;
 
-    for (int y = 0; y < MATCAP_SIZE; y++) {
-        for (int x = 0; x < MATCAP_SIZE; x++) {
-            size_t idx = (size_t)y * (size_t)MATCAP_SIZE + (size_t)x;
+    matcap_rgba_t outside_diffuse_px = {{0u, 0u, 0u, 0u}};
+    matcap_rgba_t outside_rough25_px = {{0u, 0u, 0u, 0u}};
+    matcap_rgba_t outside_rough75_px = {{0u, 0u, 0u, 0u}};
+    {
+        fm_vec3_t outside_dir_env = {{
+            -cam->forward[0],
+            -cam->forward[1],
+            -cam->forward[2]
+        }};
+        fm_vec3_norm(&outside_dir_env, &outside_dir_env);
+
+        float u_out, v_out;
+        dir_to_equirect_uv(&outside_dir_env, &u_out, &v_out);
+
+        hdr16_rgb_t outside_diff_u88;
+        hdr16_rgb_t outside_r25_u88;
+        hdr16_rgb_t outside_r75_u88;
+        sample_equirect_nearest_u88(hdri->diffuse, u_out, v_out, &outside_diff_u88);
+        sample_equirect_nearest_u88(hdri->rough25, u_out, v_out, &outside_r25_u88);
+        sample_equirect_nearest_u88(hdri->rough75, u_out, v_out, &outside_r75_u88);
+
+        for (int c = 0; c < 3; c++) {
+            outside_diffuse_px.c[c] = u88_to_u26_sat(outside_diff_u88.c[c]);
+            outside_rough25_px.c[c] = u88_to_u26_sat(outside_r25_u88.c[c]);
+            outside_rough75_px.c[c] = u88_to_u26_sat(outside_r75_u88.c[c]);
+        }
+    }
+
+    for (int y = 0; y < MATCAP_H; y++) {
+        for (int x = 0; x < MATCAP_W; x++) {
+            size_t idx = (size_t)y * (size_t)MATCAP_W + (size_t)x;
 
             fm_vec3_t forward_view;
             if (!compute_forward_view(x, y, &forward_view)) {
-                set_matcap_const(&out->diffuse[idx], 0u, 0u);
-                set_matcap_const(&out->rough25[idx], 0u, 0u);
-                set_matcap_const(&out->rough75[idx], 0u, 0u);
+                out->diffuse[idx] = outside_diffuse_px;
+                out->rough25[idx] = outside_rough25_px;
+                out->rough75[idx] = outside_rough75_px;
                 continue;
             }
 
@@ -333,7 +358,7 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
 
             uint16_t fres_u88 = g_fresnel_mask_u88[idx];
             uint8_t alpha_spec = u88_to_u08_sat(fres_u88);
-            uint8_t alpha_diff = u88_to_u08_sat(u88_sub_sat(U88_ONE, fres_u88));
+            uint8_t alpha_diff = alpha_spec;
 
             for (int c = 0; c < 3; c++) {
                 out->diffuse[idx].c[c] = u88_to_u26_sat(diff_acc[c]);
@@ -345,4 +370,10 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
             out->rough75[idx].c[3] = alpha_spec;
         }
     }
+
+    // (0,0) is used as the emission/passthrough texel when packed roughness is zero.
+    // RGB is u3.5, so 1.0 == 64.
+    set_matcap_const(&out->diffuse[0], 64u, 0u);
+    set_matcap_const(&out->rough25[0], 0u, 0u);
+    set_matcap_const(&out->rough75[0], 0u, 0u);
 }

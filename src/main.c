@@ -1,68 +1,27 @@
 #include <libdragon.h>
 #include <t3d/t3d.h>
 
+#include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "pbr_blend.h"
 #include "pbr_decode.h"
 #include "pbr_matcap.h"
 #include "pfm_hdri.h"
 
-const resolution_t RESOLUTION_256x224 = {.width = 256, .height = 224, .interlaced = INTERLACE_OFF};
-
 #define FB_COUNT 3
+#define PIPELINE_BUFFERS 2
+#define BUFFER_W 320
+#define BUFFER_H 240
 
-#define HDRI_PATH "rom:/textures/ferndale_studio"
-#define GBUFFER_ALBEDO_PATH "rom:/models/albedo.rgba16.sprite"
-#define GBUFFER_PACKED_PATH "rom:/models/packed.rgba16.sprite"
-#define DEBUG_DRAW_MATCAPS 0
-#define DRAW_FRAME 1
-#define DUMMY_MATCAP_W 16
-#define DUMMY_MATCAP_H 32
-#define DUMMY_MATCAP_TEXELS ((size_t)DUMMY_MATCAP_W * (size_t)DUMMY_MATCAP_H)
+#define HDRI_PATH "rom:/textures/courtyard"
+#define GBUFFER_ALBEDO_PATH "rom:/models/spheres_albedo.rgba16.sprite"
+#define GBUFFER_PACKED_PATH "rom:/models/spheres_packed.rgba16.sprite"
 
-static matcap_rgba_t dummy_diffuse_matcap[DUMMY_MATCAP_TEXELS];
-static matcap_rgba_t dummy_rough25_matcap[DUMMY_MATCAP_TEXELS];
-static matcap_rgba_t dummy_rough75_matcap[DUMMY_MATCAP_TEXELS];
-
-static void init_dummy_matcaps_16x32(MatcapSet *out)
-{
-    for (int y = 0; y < DUMMY_MATCAP_H; y++) {
-        for (int x = 0; x < DUMMY_MATCAP_W; x++) {
-            size_t idx = (size_t)y * (size_t)DUMMY_MATCAP_W + (size_t)x;
-            uint8_t u = (uint8_t)((x * 255) / (DUMMY_MATCAP_W - 1));
-            uint8_t v = (uint8_t)((y * 255) / (DUMMY_MATCAP_H - 1));
-            dummy_diffuse_matcap[idx].c[0] = u;
-            dummy_diffuse_matcap[idx].c[1] = v;
-            dummy_diffuse_matcap[idx].c[2] = 192u;
-            dummy_diffuse_matcap[idx].c[3] = 255u;
-
-            dummy_rough25_matcap[idx].c[0] = 48u;
-            dummy_rough25_matcap[idx].c[1] = u;
-            dummy_rough25_matcap[idx].c[2] = v;
-            dummy_rough25_matcap[idx].c[3] = 255u;
-
-            dummy_rough75_matcap[idx].c[0] = 192u;
-            dummy_rough75_matcap[idx].c[1] = v;
-            dummy_rough75_matcap[idx].c[2] = u;
-            dummy_rough75_matcap[idx].c[3] = 255u;
-        }
-    }
-
-    /* Emission fallback texel: diffuse=white, specular=black. */
-    memset(&dummy_diffuse_matcap[0], 0xFF, sizeof(dummy_diffuse_matcap[0]));
-    memset(&dummy_rough25_matcap[0], 0x00, sizeof(dummy_rough25_matcap[0]));
-    memset(&dummy_rough75_matcap[0], 0x00, sizeof(dummy_rough75_matcap[0]));
-    dummy_rough25_matcap[0].c[3] = 255u;
-    dummy_rough75_matcap[0].c[3] = 255u;
-
-    out->w = DUMMY_MATCAP_W;
-    out->h = DUMMY_MATCAP_H;
-    out->diffuse = dummy_diffuse_matcap;
-    out->rough25 = dummy_rough25_matcap;
-    out->rough75 = dummy_rough75_matcap;
-}
+#define MEASURE_RSP_PERF 1
 
 const uint16_t *sprite_pixels_u16(const sprite_t *spr)
 {
@@ -74,77 +33,17 @@ bool sprite_dim_match(const sprite_t *spr, int w, int h)
     return spr && spr->width == w && spr->height == h;
 }
 
-static inline uint16_t pack_rgb5551_from_u88(uint16_t r88, uint16_t g88, uint16_t b88)
-{
-    if (r88 > 256u) r88 = 256u;
-    if (g88 > 256u) g88 = 256u;
-    if (b88 > 256u) b88 = 256u;
-
-    uint16_t r5 = (uint16_t)((r88 * 31u + 128u) >> 8);
-    uint16_t g5 = (uint16_t)((g88 * 31u + 128u) >> 8);
-    uint16_t b5 = (uint16_t)((b88 * 31u + 128u) >> 8);
-    return (uint16_t)((r5 << 11) | (g5 << 6) | (b5 << 1) | 1u);
-}
-
-#if DEBUG_DRAW_MATCAPS
-static inline const matcap_rgba_t *debug_matcap_texel(const MatcapSet *mats, int slot, int tex_idx)
-{
-    if (slot == 0) {
-        return &mats->diffuse[tex_idx];
-    }
-    if (slot == 1) {
-        return &mats->rough25[tex_idx];
-    }
-    return &mats->rough75[tex_idx];
-}
-
-static void draw_debug_matcaps(uint16_t *dst, int w, int h, const MatcapSet *mats)
-{
-    const int cols = 3;    /* diffuse / rough25 / rough75 */
-    const int rows = 1;
-    const int tile = 80;
-    const int pad = 1;
-    const int ox0 = 2;
-    const int oy0 = 2;
-    const int src_size = MATCAP_SIZE;
-
-    for (int yslot = 0; yslot < rows; yslot++) {
-        for (int xslot = 0; xslot < cols; xslot++) {
-            int ox = ox0 + xslot * (tile + pad);
-            int oy = oy0 + yslot * (tile + pad);
-            int slot = xslot;
-
-            for (int ty = 0; ty < tile; ty++) {
-                int py = oy + ty;
-                if ((unsigned)py >= (unsigned)h) continue;
-                int sy = (ty * src_size) / tile;
-
-                for (int tx = 0; tx < tile; tx++) {
-                    int px = ox + tx;
-                    if ((unsigned)px >= (unsigned)w) continue;
-                    int sx = (tx * src_size) / tile;
-                    int sidx = sy * src_size + sx;
-                    const matcap_rgba_t *src = debug_matcap_texel(mats, slot, sidx);
-                    dst[(size_t)py * (size_t)w + (size_t)px] =
-                        pack_rgb5551_from_u88((uint16_t)src->c[0] << 2,
-                                              (uint16_t)src->c[1] << 2,
-                                              (uint16_t)src->c[2] << 2);
-                }
-            }
-        }
-    }
-}
-#endif
-
 static bool load_gbuffers_from_sprites(const char *albedo_path, const char *packed_path, sprite_t **albedo, sprite_t **packed)
 {
-    *albedo = sprite_load(albedo_path);
-    *packed = sprite_load(packed_path);
+    sprite_t* _albedo = sprite_load(albedo_path);
+    sprite_t* _packed = sprite_load(packed_path);
 
-    if (!*albedo || !*packed) {
+    if (!_albedo || !_packed) {
         debugf("sprite load failed: %s / %s\n", albedo_path, packed_path);
         return false;
     }
+    *albedo = _albedo;
+    *packed = _packed;
 
     return true;
 }
@@ -152,7 +51,7 @@ static bool load_gbuffers_from_sprites(const char *albedo_path, const char *pack
 static void setup_default_lighting(LightingState *ls)
 {
     memset(ls, 0, sizeof(*ls));
-    ls->count = 2;
+    ls->count = 0;
 
     ls->dir[0][0] = 0.707f;
     ls->dir[0][1] = 0.577f;
@@ -169,6 +68,43 @@ static void setup_default_lighting(LightingState *ls)
     ls->color[1][2] = 1.0f;
 }
 
+static inline float clampf_local(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// Packed RGBA16 layout is RRRRRGGGGGBBBBBA:
+// R(5)=roughness, G(5)=X, B(5)=Y, A(1)=metalness.
+// Clamp XY so ||(x,y)|| <= 1 before decoding.
+static void preprocess_packed_rgba16_normals(const uint16_t *src, uint16_t *dst, int w, int h)
+{
+    const size_t n = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < n; i++) {
+        const uint16_t p = src[i];
+
+        const uint16_t rough5 = (p >> 11) & 0x1Fu;
+        const uint16_t x5 = (p >> 6) & 0x1Fu;
+        const uint16_t y5 = (p >> 1) & 0x1Fu;
+        const uint16_t m1 = p & 0x01u;
+
+        float x = ((float)x5 * (2.0f / 31.0f)) - 1.0f;
+        float y = ((float)y5 * (2.0f / 31.0f)) - 1.0f;
+        float len2 = x * x + y * y;
+        if (len2 > 1.0f) {
+            float inv_len = 1.0f / sqrtf(len2);
+            x *= inv_len;
+            y *= inv_len;
+        }
+
+        uint16_t x5_out = (uint16_t)(clampf_local((x + 1.0f) * 0.5f, 0.0f, 1.0f) * 31.0f + 0.5f);
+        uint16_t y5_out = (uint16_t)(clampf_local((y + 1.0f) * 0.5f, 0.0f, 1.0f) * 31.0f + 0.5f);
+
+        dst[i] = (uint16_t)((rough5 << 11) | (x5_out << 6) | (y5_out << 1) | m1);
+    }
+}
+
 int main(void)
 {
     debug_init_isviewer();
@@ -177,13 +113,13 @@ int main(void)
 
     dfs_init(DFS_DEFAULT_LOCATION);
 
-    display_init(RESOLUTION_256x224, DEPTH_16_BPP, FB_COUNT, GAMMA_NONE, FILTERS_RESAMPLE_ANTIALIAS_DEDITHER);
+    display_init(RESOLUTION_320x240, DEPTH_16_BPP, FB_COUNT, GAMMA_CORRECT_DITHER, FILTERS_RESAMPLE_ANTIALIAS_DEDITHER);
     rdpq_init();
     t3d_init((T3DInitParams){});
+    rsp_pbr_blend_init();
 
     sprite_t *albedo_spr = NULL;
     sprite_t *packed_spr = NULL;
-
     if (!load_gbuffers_from_sprites(GBUFFER_ALBEDO_PATH, GBUFFER_PACKED_PATH, &albedo_spr, &packed_spr)) {
         debugf("GBuffer load failed\n");
         for (;;) {}
@@ -196,6 +132,10 @@ int main(void)
         debugf("GBuffer size mismatch\n");
         for (;;) {}
     }
+    if (w != BUFFER_W || h != BUFFER_H) {
+        debugf("Expected %dx%d buffers, got %dx%d\n", BUFFER_W, BUFFER_H, w, h);
+        for (;;) {}
+    }
 
     HDRISet hdri = {0};
     if (!load_pfm_hdri(HDRI_PATH, &hdri)) {
@@ -203,48 +143,40 @@ int main(void)
         for (;;) {}
     }
 
-    MatcapSet mats;
-    if (!alloc_matcaps(&mats)) {
-        debugf("matcap alloc failed\n");
-        for (;;) {}
+    MatcapSet mats_db[PIPELINE_BUFFERS] = {0};
+    for (int i = 0; i < PIPELINE_BUFFERS; i++) {
+        if (!alloc_matcaps(&mats_db[i])) {
+            debugf("matcap alloc failed\n");
+            for (;;) {}
+        }
     }
 
-    uint16_t *final_rgba16 = malloc((size_t)w * (size_t)h * sizeof(uint16_t));
-    if (!final_rgba16) {
-        debugf("final buffer alloc failed\n");
-        for (;;) {}
-    }
-    
-    surface_t decoded_diffuse_surf = surface_alloc(FMT_RGBA32, w, h);
-    uint32_t *decoded_diffuse = UncachedAddr(decoded_diffuse_surf.buffer);
-    surface_t decoded_rough25_surf = surface_alloc(FMT_RGBA32, w, h);
-    uint32_t *decoded_rough25 = UncachedAddr(decoded_rough25_surf.buffer);
-    surface_t decoded_rough75_surf = surface_alloc(FMT_RGBA32, w, h);
-    uint32_t *decoded_rough75 = UncachedAddr(decoded_rough75_surf.buffer);
+    surface_t decoded_lighting_surf[PIPELINE_BUFFERS];
+    uint32_t *decoded_lighting[PIPELINE_BUFFERS];
 
-    //surface_t decoded_diffuse_surf = surface_alloc(FMT_RGBA32, w, h);
-    //uint32_t *decoded_diffuse = malloc_uncached((size_t)w * (size_t)h * sizeof(uint32_t));
-    //surface_t decoded_rough25_surf = surface_alloc(FMT_RGBA32, w, h);
-    //uint32_t *decoded_rough25 = malloc_uncached((size_t)w * (size_t)h * sizeof(uint32_t));
-    //surface_t decoded_rough75_surf = surface_alloc(FMT_RGBA32, w, h);
-    //uint32_t *decoded_rough75 = malloc_uncached((size_t)w * (size_t)h * sizeof(uint32_t));
+    for (int i = 0; i < PIPELINE_BUFFERS; i++) {
+        decoded_lighting_surf[i] = surface_alloc(FMT_RGBA32, w, h * 3);
 
-    if (!decoded_diffuse || !decoded_rough25 || !decoded_rough75) {
-        debugf("decode buffers alloc failed\n");
-        for (;;) {}
+        decoded_lighting[i] = UncachedAddr(decoded_lighting_surf[i].buffer);
+
+        if (!decoded_lighting[i]) {
+            debugf("decode buffers alloc failed\n");
+            for (;;) {}
+        }
     }
-    memset(final_rgba16, 0, (size_t)w * (size_t)h * sizeof(uint16_t));
 
     const uint16_t *albedo = sprite_pixels_u16(albedo_spr);
-    const uint16_t *packed = sprite_pixels_u16(packed_spr);
-    if (!albedo || !packed) {
+    const uint16_t *packed_src = sprite_pixels_u16(packed_spr);
+    uint16_t *packed_preprocessed = malloc((size_t)w * (size_t)h * sizeof(uint16_t));
+    const uint16_t *packed = packed_preprocessed;
+    if (!albedo || !packed_src || !packed_preprocessed) {
         debugf("sprite pixel access failed\n");
         for (;;) {}
     }
+    preprocess_packed_rgba16_normals(packed_src, packed_preprocessed, w, h);
 
-    (void)albedo;
-    MatcapSet dummy_mats = {0};
-    init_dummy_matcaps_16x32(&dummy_mats);
+    surface_t albedo_surf = surface_make_linear((void *)albedo, FMT_RGBA16, (uint16_t)w, (uint16_t)h);
+    surface_t packed_surf = surface_make_linear((void *)packed, FMT_RGBA16, (uint16_t)w, (uint16_t)h);
 
     LightingState lights;
     setup_default_lighting(&lights);
@@ -253,72 +185,91 @@ int main(void)
     float yaw = 0.0f;
     int frame = 0;
 
+    surface_t *pending_disp = NULL;
+    rspq_syncpoint_t pending_sync = 0;
+    bool pending_show = false;
+
     for (;;) {
         uint64_t t_frame0 = get_ticks_us();
+        int slot = frame & (PIPELINE_BUFFERS - 1);
 
-        yaw += 0.03f;
+        yaw += 0.06f;
         build_camera_from_yaw(yaw, &cam);
 
         uint64_t t_mat0 = get_ticks_us();
-        generate_matcaps(&cam, &lights, &hdri, &mats);
+        generate_matcaps(&cam, &lights, &hdri, &mats_db[slot]);
         uint64_t t_mat1 = get_ticks_us();
 
-        uint64_t t_com0 = get_ticks_us();
-#if DRAW_FRAME
-        decode_packed_cpu(packed,
-                                  decoded_diffuse,
-                                  decoded_rough25,
-                                  decoded_rough75,
-                                  w,
-                                  h,
-                                  &dummy_mats);
-#endif
-        uint64_t t_com1 = get_ticks_us();
-#if DEBUG_DRAW_MATCAPS
-        draw_debug_matcaps(final_rgba16, w, h, &mats);
-#endif
+        uint64_t t_dec0 = get_ticks_us();
+        decode_packed_cpu_lighting_interleaved8(packed,
+                          (uint8_t*)decoded_lighting[slot],
+                          w,
+                          h,
+                          &mats_db[slot]);
+        uint64_t t_dec1 = get_ticks_us();
+
+        if (pending_show) {
+            //rspq_syncpoint_wait(pending_sync);
+            rdpq_attach(pending_disp, NULL);
+            rdpq_detach_show();
+            pending_show = false;
+            pending_disp = NULL;
+        }
 
         surface_t *disp = display_get();
-        if (!disp) continue;
-
+        if (!disp) {
+            continue;
+        }
         if (disp->width != w || disp->height != h) {
             debugf("Display/sprite dimension mismatch: display=%dx%d sprite=%dx%d\n",
                    disp->width, disp->height, w, h);
             for (;;) {}
         }
-
-        rdpq_attach(disp, display_get_zbuf());
-
-        uint8_t *dst_base = (uint8_t *)disp->buffer;
-        int dst_stride = disp->stride;
-        for (int y = 0; y < h; y++) {
-            memcpy(dst_base + y * dst_stride, &final_rgba16[(size_t)y * (size_t)w], (size_t)w * sizeof(uint16_t));
+        
+        uint64_t t_rsp0 = get_ticks_us();
+        if (MEASURE_RSP_PERF) {
+            rspq_wait();
+            rspq_highpri_begin();
         }
 
-        rdpq_detach_show();
+        rsp_pbr_blend_set_gbuffer(&albedo_surf, &packed_surf, disp);
+        rsp_pbr_blend_set_lighting_buffer(&decoded_lighting_surf[slot]);
+        rsp_pbr_blend_set_dither_matrix();
+        rsp_pbr_blend_postprocess();
+        //pending_sync = rspq_syncpoint_new();
+        pending_disp = disp;
+        pending_show = true;
+
+        if (MEASURE_RSP_PERF) {
+            rspq_highpri_end();
+            rspq_flush();
+            rspq_highpri_sync();
+        }
+
+        uint64_t t_rsp1 = get_ticks_us();
 
         uint64_t t_frame1 = get_ticks_us();
         uint64_t mat_us = t_mat1 - t_mat0;
-        uint64_t com_us = t_com1 - t_com0;
+        uint64_t dec_us = t_dec1 - t_dec0;
+        uint64_t rsp_submit_us = t_rsp1 - t_rsp0;
         uint64_t frame_us = t_frame1 - t_frame0;
         frame++;
         if ((frame % 30) == 0) {
-            debugf("matcap_generate_us=%llu decode_16x32_us=%llu frame_us=%llu\n",
+            debugf("matcap_generate_us=%llu decode_us=%llu rsp_submit_us=%llu frame_us=%llu\n",
                    (unsigned long long)mat_us,
-                   (unsigned long long)com_us,
+                   (unsigned long long)dec_us,
+                   (unsigned long long)rsp_submit_us,
                    (unsigned long long)frame_us);
         }
-        (void)mat_us;
-        (void)com_us;
-        (void)frame_us;
     }
 
     sprite_free(albedo_spr);
     sprite_free(packed_spr);
-    free(final_rgba16);
-    //surface_free(&decoded_diffuse_surf);
-    //surface_free(&decoded_rough25_surf);
-    //surface_free(&decoded_rough75_surf);
+
+    for (int i = 0; i < PIPELINE_BUFFERS; i++) {
+        surface_free(&decoded_lighting_surf[i]);
+        free_matcaps(&mats_db[i]);
+    }
 
     t3d_destroy();
     return 0;

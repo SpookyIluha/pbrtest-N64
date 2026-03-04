@@ -53,7 +53,7 @@ $(FILESYSTEM_DIR)/textures/%.sprite: $(ASSETS_DIR)/textures/%.png
 $(FILESYSTEM_DIR)/models/%.sprite: $(ASSETS_DIR)/models/%.png
 	@mkdir -p $(dir $@)
 	@echo "    [SPRITE] $@"
-	$(N64_MKSPRITE) $(MKSPRITE_FLAGS) --mipmap NONE --compress 1 -o $(dir $@) "$<"
+	$(N64_MKSPRITE) $(MKSPRITE_FLAGS) --mipmap NONE  --dither ORDERED --compress 1 -o $(dir $@) "$<"
 
 $(FILESYSTEM_DIR)/fonts/%.font64: $(ASSETS_DIR)/fonts/%.ttf
 	@mkdir -p $(dir $@)
