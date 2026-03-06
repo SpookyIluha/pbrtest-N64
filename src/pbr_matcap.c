@@ -14,24 +14,21 @@
 #define INV_MATCAP_W (1.0f / (float)MATCAP_W)
 #define INV_MATCAP_H (1.0f / (float)MATCAP_H)
 
-static float g_fresnel_mask_f32[MATCAP_TEXELS];
-static uint16_t g_fresnel_mask_u88[MATCAP_TEXELS];
+static uint8_t g_fresnel_mask_u8[MATCAP_TEXELS];
 static bool g_fresnel_masks_init = false;
 static int g_hdri_sample_w = 0;
 static int g_hdri_sample_h = 0;
 
-static inline void set_hdr_const(hdr16_rgb_t *dst, uint16_t v)
+static inline void set_hdr_const(hdri_color_t *dst, uint16_t v)
 {
-    dst->c[0] = v;
-    dst->c[1] = v;
-    dst->c[2] = v;
+    for(int i = 0; i < 3; i++)
+        dst->c[i] = v;
 }
 
-static inline void set_matcap_const(matcap_rgba_t *dst, uint8_t rgb, uint8_t a)
+static inline void set_matcap_const(matcap_color_t* dst, uint8_t rgb, uint8_t a)
 {
-    dst->c[0] = rgb;
-    dst->c[1] = rgb;
-    dst->c[2] = rgb;
+    for(int i = 0; i < 3; i++)
+        dst->c[i] = rgb;
     dst->c[3] = a;
 }
 
@@ -42,9 +39,9 @@ bool alloc_matcaps(MatcapSet *m)
     m->h = MATCAP_H;
 
     size_t texels = (size_t)m->w * (size_t)m->h;
-    m->diffuse = malloc(sizeof(matcap_rgba_t) * texels);
-    m->rough25 = malloc(sizeof(matcap_rgba_t) * texels);
-    m->rough75 = malloc(sizeof(matcap_rgba_t) * texels);
+    m->diffuse = malloc(sizeof(matcap_color_t) * texels);
+    m->rough25 = malloc(sizeof(matcap_color_t) * texels);
+    m->rough75 = malloc(sizeof(matcap_color_t) * texels);
 
     if (!m->diffuse || !m->rough25 || !m->rough75) {
         free_matcaps(m);
@@ -104,7 +101,46 @@ static inline void dir_to_equirect_uv(const fm_vec3_t *dir, float *u, float *v)
     *v = fast_acosf(dir->y) * INV_PI_F;
 }
 
-static inline void sample_equirect_nearest_u88(const hdr16_rgb_t *img, float u, float v, hdr16_rgb_t *out_rgb)
+static inline void dir_to_octa(const fm_vec3_t *dir, float *u, float *v)
+{
+    float invL1 = 1.0f / (fabsf(dir->x) + fabsf(dir->y) + fabsf(dir->z));
+
+    float x = dir->x * invL1;
+    float y = dir->y * invL1;
+    float z = dir->z * invL1;
+
+    if (z < 0.0f)
+    {
+        float oldX = x;
+        x = (1.0f - fabsf(y)) * (oldX >= 0.0f ? 1.0f : -1.0f);
+        y = (1.0f - fabsf(oldX)) * (y >= 0.0f ? 1.0f : -1.0f);
+    }
+
+    *u = x * 0.5f + 0.5f;
+    *v = y * 0.5f + 0.5f;
+}
+
+static inline void  dual_paraboloid_project(const fm_vec3_t *dir, float *u, float *v)
+{
+    register float m;
+
+    if (dir->z >= 0.0f)
+    {
+        m = 1.0f / (1.0f + dir->z);
+
+        *u = 0.5f * (dir->x * m + 1.0f);
+        *v = 0.5f * (dir->y * m + 1.0f);
+    }
+    else
+    {
+        m = 1.0f / (1.0f - dir->z);
+
+        *u = 0.5f * (dir->x * m + 1.0f);
+        *v = 0.5f * (-dir->y * m + 1.0f);
+    }
+}
+
+static inline void hdri_sample_equirect_nearest(const hdri_color_t *img, float u, float v, hdri_color_t *out_rgb)
 {
     if (!img || g_hdri_sample_w <= 0 || g_hdri_sample_h <= 0) {
         set_hdr_const(out_rgb, U88_ONE);
@@ -149,27 +185,6 @@ static inline bool compute_forward_view(int x, int y, fm_vec3_t *out)
     return true;
 }
 
-static inline uint16_t quantize_u88_sat(float v)
-{
-    if (v <= 0.0f) return U88_ZERO;
-    float s = v * (float)U88_ONE + 0.5f;
-    if (s >= (float)U88_MAX) return U88_MAX;
-    return (uint16_t)s;
-}
-
-static inline uint8_t u88_to_u26_sat(uint16_t v)
-{
-    uint16_t q = (uint16_t)((v + 2u) >> 2);
-    if (q > 255u) q = 255u;
-    return (uint8_t)q;
-}
-
-static inline uint8_t u88_to_u08_sat(uint16_t v)
-{
-    if (v >= U88_ONE) return 255u;
-    return (uint8_t)((((uint32_t)v * 255u) + 128u) >> 8);
-}
-
 static void init_fresnel_masks(float f0)
 {
     if (g_fresnel_masks_init) return;
@@ -181,8 +196,7 @@ static void init_fresnel_masks(float f0)
             fm_vec3_t forward_view;
             bool valid = compute_forward_view(x, y, &forward_view);
             if (!valid) {
-                g_fresnel_mask_f32[idx] = 0.0f;
-                g_fresnel_mask_u88[idx] = 0;
+                g_fresnel_mask_u8[idx] = 0;
                 continue;
             }
 
@@ -192,8 +206,7 @@ static void init_fresnel_masks(float f0)
             float x4 = x2 * x2;
             float x5 = x4 * x;
             float fres = f0 + (1.0f - f0) * x5;
-            g_fresnel_mask_f32[idx] = fres;
-            g_fresnel_mask_u88[idx] = (uint16_t)(fres * (float)U88_ONE + 0.5f);
+            g_fresnel_mask_u8[idx] = fres * 255.0f;
         }
     }
 
@@ -218,9 +231,8 @@ void build_camera_from_yaw(float yaw, CameraState *cam)
 // out - output vector
 static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t *L, const float roughness[2], fm_vec3_t *out)
 {
-    out->x = 0.0f;
-    out->y = 0.0f;
-    out->z = 0.0f;
+    for(int i = 0; i < 3; i++)
+        out->v[i] = 0.0f;
 
     float NdotV = fm_vec3_dot(N, V);
     float NdotL = fm_vec3_dot(N, L);
@@ -252,13 +264,13 @@ static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t 
 
         float brdf = (D * G) / (4.0f * NdotV * NdotL + 1e-6f);
         float lit = brdf * NdotL;
-        if (i == 0) out->x = lit;
-        else out->y = lit;
+        out->v[i] = lit;
     }
 }
 
 void generate_matcaps(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out)
 {
+    LightingState lightingstate = *lights;
     init_fresnel_masks(FRESNEL_F0_DEFAULT);
     g_hdri_sample_w = hdri ? hdri->w : 0;
     g_hdri_sample_h = hdri ? hdri->h : 0;
@@ -272,9 +284,10 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
     int light_count = lights ? lights->count : 0;
     if (light_count > 4) light_count = 4;
 
-    matcap_rgba_t outside_diffuse_px = {{0u, 0u, 0u, 0u}};
-    matcap_rgba_t outside_rough25_px = {{0u, 0u, 0u, 0u}};
-    matcap_rgba_t outside_rough75_px = {{0u, 0u, 0u, 0u}};
+    matcap_color_t outside_diffuse_px = {{0u, 0u, 0u, 0u}};
+    matcap_color_t outside_rough25_px = {{0u, 0u, 0u, 0u}};
+    matcap_color_t outside_rough75_px = {{0u, 0u, 0u, 0u}};
+    // compute one color for pixels outside the RR, we assume that the direction for them is -forward
     {
         fm_vec3_t outside_dir_env = {{
             -cam->forward[0],
@@ -286,17 +299,17 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
         float u_out, v_out;
         dir_to_equirect_uv(&outside_dir_env, &u_out, &v_out);
 
-        hdr16_rgb_t outside_diff_u88;
-        hdr16_rgb_t outside_r25_u88;
-        hdr16_rgb_t outside_r75_u88;
-        sample_equirect_nearest_u88(hdri->diffuse, u_out, v_out, &outside_diff_u88);
-        sample_equirect_nearest_u88(hdri->rough25, u_out, v_out, &outside_r25_u88);
-        sample_equirect_nearest_u88(hdri->rough75, u_out, v_out, &outside_r75_u88);
+        hdri_color_t outside_diff_u88;
+        hdri_color_t outside_r25_u88;
+        hdri_color_t outside_r75_u88;
+        hdri_sample_equirect_nearest(hdri->diffuse, u_out, v_out, &outside_diff_u88);
+        hdri_sample_equirect_nearest(hdri->rough25, u_out, v_out, &outside_r25_u88);
+        hdri_sample_equirect_nearest(hdri->rough75, u_out, v_out, &outside_r75_u88);
 
         for (int c = 0; c < 3; c++) {
-            outside_diffuse_px.c[c] = u88_to_u26_sat(outside_diff_u88.c[c]);
-            outside_rough25_px.c[c] = u88_to_u26_sat(outside_r25_u88.c[c]);
-            outside_rough75_px.c[c] = u88_to_u26_sat(outside_r75_u88.c[c]);
+            outside_diffuse_px.c[c] = (uint8_t)fminf(outside_diff_u88.c[c] * lights->exposure, 255.0f);
+            outside_rough25_px.c[c] = (uint8_t)fminf(outside_r25_u88.c[c] * lights->exposure, 255.0f);
+            outside_rough75_px.c[c] = (uint8_t)fminf(outside_r75_u88.c[c] * lights->exposure, 255.0f);
         }
     }
 
@@ -319,27 +332,32 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
             fm_vec3_t spec_dir_env = spec_dir_view;
             rotate_y(&spec_dir_env, cos_yaw, sin_yaw);
 
-            float u_diff, v_diff;
-            float u_spec, v_spec;
-            dir_to_equirect_uv(&diffuse_dir_env, &u_diff, &v_diff);
-            dir_to_equirect_uv(&spec_dir_env, &u_spec, &v_spec);
+            float u_diff = 0, v_diff = 0;
+            float u_spec = 0, v_spec = 0;
+            dual_paraboloid_project(&diffuse_dir_env, &u_diff, &v_diff);
+            dual_paraboloid_project(&spec_dir_env, &u_spec, &v_spec);
 
-            hdr16_rgb_t env_diff;
-            hdr16_rgb_t env_s25;
-            hdr16_rgb_t env_s75;
-            sample_equirect_nearest_u88(hdri->diffuse, u_diff, v_diff, &env_diff);
-            sample_equirect_nearest_u88(hdri->rough25, u_spec, v_spec, &env_s25);
-            sample_equirect_nearest_u88(hdri->rough75, u_spec, v_spec, &env_s75);
+            float_color_t total_diffuse = {0};
+            float_color_t total_s25 = {0};
+            float_color_t total_s75 = {0};
+            hdri_color_t hdri_diffuse = {0};
+            hdri_color_t hdri_rough25 = {0};
+            hdri_color_t hdri_rough75 = {0};
+            hdri_sample_equirect_nearest(hdri->diffuse, u_diff, v_diff, &hdri_diffuse);
+            hdri_sample_equirect_nearest(hdri->rough25, u_spec, v_spec, &hdri_rough25);
+            hdri_sample_equirect_nearest(hdri->rough75, u_spec, v_spec, &hdri_rough75);
 
-            uint16_t diff_acc[3] = {env_diff.c[0], env_diff.c[1], env_diff.c[2]};
-            uint16_t s25_acc[3] = {env_s25.c[0], env_s25.c[1], env_s25.c[2]};
-            uint16_t s75_acc[3] = {env_s75.c[0], env_s75.c[1], env_s75.c[2]};
+            for (int c = 0; c < 3; c++) {
+                total_diffuse.c[c] = hdri_diffuse.c[c] * lightingstate.hdri_brightness;
+                total_s25.c[c] = hdri_rough25.c[c] * lightingstate.hdri_brightness;
+                total_s75.c[c] = hdri_rough75.c[c] * lightingstate.hdri_brightness;
+            }
 
             for (int li = 0; li < light_count; li++) {
                 fm_vec3_t L = {{
-                    lights->dir[li][0],
-                    lights->dir[li][1],
-                    lights->dir[li][2]
+                    lightingstate.dir[li][0],
+                    lightingstate.dir[li][1],
+                    lightingstate.dir[li][2]
                 }};
 
                 fm_vec3_t ggx;
@@ -347,27 +365,26 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
                 if (ggx.z <= 0.0f) continue;
 
                 for (int c = 0; c < 3; c++) {
-                    uint16_t d_add = quantize_u88_sat(lights->color[li][c] * ggx.z);
-                    uint16_t s25_add = quantize_u88_sat(lights->color[li][c] * ggx.x);
-                    uint16_t s75_add = quantize_u88_sat(lights->color[li][c] * ggx.y);
-                    diff_acc[c] = u88_add_sat(diff_acc[c], d_add);
-                    s25_acc[c] = u88_add_sat(s25_acc[c], s25_add);
-                    s75_acc[c] = u88_add_sat(s75_acc[c], s75_add);
+                    total_diffuse.c[c] += (lightingstate.color[li][c] * ggx.z);
+                    total_s25.c[c] += (lightingstate.color[li][c] * ggx.x);
+                    total_s75.c[c] += (lightingstate.color[li][c] * ggx.y);
                 }
             }
 
-            uint16_t fres_u88 = g_fresnel_mask_u88[idx];
-            uint8_t alpha_spec = u88_to_u08_sat(fres_u88);
-            uint8_t alpha_diff = alpha_spec;
+            for (int c = 0; c < 3; c++) {
+                total_diffuse.c[c] = fminf(total_diffuse.c[c] * lightingstate.exposure, 255.0f);
+                total_s25.c[c] = fminf(total_s25.c[c] * lightingstate.exposure, 255.0f);
+                total_s75.c[c] = fminf(total_s75.c[c] * lightingstate.exposure, 255.0f);
+            }
+
+            uint8_t fres_u8 = g_fresnel_mask_u8[idx];
 
             for (int c = 0; c < 3; c++) {
-                out->diffuse[idx].c[c] = u88_to_u26_sat(diff_acc[c]);
-                out->rough25[idx].c[c] = u88_to_u26_sat(s25_acc[c]);
-                out->rough75[idx].c[c] = u88_to_u26_sat(s75_acc[c]);
+                out->diffuse[idx].c[c] = (uint8_t)(total_diffuse.c[c]);
+                out->rough25[idx].c[c] = (uint8_t)(total_s25.c[c]);
+                out->rough75[idx].c[c] = (uint8_t)(total_s75.c[c]);
             }
-            out->diffuse[idx].c[3] = alpha_diff;
-            out->rough25[idx].c[3] = alpha_spec;
-            out->rough75[idx].c[3] = alpha_spec;
+            out->diffuse[idx].c[3] = fres_u8;
         }
     }
 

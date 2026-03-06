@@ -151,10 +151,10 @@ static inline uint16_t quantize_hdr_u88(float v)
     return (uint16_t)scaled;
 }
 
-static hdr16_rgb_t *convert_rgbf_to_u88(const float *rgb, int w, int h)
+static hdri_color_t *convert_rgbf_to_u88(const float *rgb, int w, int h)
 {
     size_t texels = (size_t)w * (size_t)h;
-    hdr16_rgb_t *out = malloc(sizeof(hdr16_rgb_t) * texels);
+    hdri_color_t *out = malloc(sizeof(hdri_color_t) * texels);
     if (!out) return NULL;
 
     for (size_t i = 0; i < texels; i++) {
@@ -177,6 +177,12 @@ void free_hdri(HDRISet *hdri)
     hdri->rough75 = NULL;
     hdri->w = 0;
     hdri->h = 0;
+    hdri->diffuse_w = 0;
+    hdri->diffuse_h = 0;
+    hdri->rough25_w = 0;
+    hdri->rough25_h = 0;
+    hdri->rough75_w = 0;
+    hdri->rough75_h = 0;
 }
 
 bool load_pfm_hdri(const char *path, HDRISet *out)
@@ -188,20 +194,15 @@ bool load_pfm_hdri(const char *path, HDRISet *out)
     float *low_f = NULL;
     float *high_f = NULL;
 
-    hdr16_rgb_t *diff_u88 = NULL;
-    hdr16_rgb_t *low_u88 = NULL;
-    hdr16_rgb_t *high_u88 = NULL;
+    hdri_color_t *diff_u88 = NULL;
+    hdri_color_t *low_u88 = NULL;
+    hdri_color_t *high_u88 = NULL;
 
     normalize_base_path(path, base, sizeof(base));
 
     if (!load_pfm_suffixed(base, "_d", &dw, &dh, &diff_f)) goto fail;
     if (!load_pfm_suffixed(base, "_s25", &lw, &lh, &low_f)) goto fail;
     if (!load_pfm_suffixed(base, "_s75", &hw, &hh, &high_f)) goto fail;
-
-    if (dw != lw || dh != lh || dw != hw || dh != hh) {
-        debugf("HDRI size mismatch: _d=%dx%d _s25=%dx%d _s75=%dx%d\n", dw, dh, lw, lh, hw, hh);
-        goto fail;
-    }
 
     diff_u88 = convert_rgbf_to_u88(diff_f, dw, dh);
     low_u88 = convert_rgbf_to_u88(low_f, lw, lh);
@@ -219,12 +220,19 @@ bool load_pfm_hdri(const char *path, HDRISet *out)
     memset(out, 0, sizeof(*out));
     out->w = dw;
     out->h = dh;
+    out->diffuse_w = dw;
+    out->diffuse_h = dh;
+    out->rough25_w = lw;
+    out->rough25_h = lh;
+    out->rough75_w = hw;
+    out->rough75_h = hh;
     out->diffuse = diff_u88;
     out->rough25 = low_u88;
     out->rough75 = high_u88;
 
     snprintf(g_hdri_base_path, sizeof(g_hdri_base_path), "%s", base);
-    debugf("Loaded HDRI triplet (u8.8): %s_d/_s25/_s75.pbm (%dx%d)\n", base, dw, dh);
+    debugf("Loaded HDRI triplet (u8.8): %s_d=%dx%d _s25=%dx%d _s75=%dx%d\n",
+           base, dw, dh, lw, lh, hw, hh);
     return true;
 
 fail:

@@ -334,13 +334,13 @@ void decode_packed_cpu_lighting_interleaved8(const uint16_t *packed16,
     const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
 
     const uint16_t *p_ptr = packed16;
-    uint8_t *dst = out_lighting_interleaved;
+    register uint8_t *dst = out_lighting_interleaved;
     size_t blocks = n / DECODE_INTERLEAVED8_PIXELS;
 
     while (blocks--) {
-        uint32_t *out_diff = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_DIFFUSE);
-        uint32_t *out_r25 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH25);
-        uint32_t *out_r75 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH75);
+        register uint32_t *out_diff = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_DIFFUSE);
+        register uint32_t *out_r25 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH25);
+        register uint32_t *out_r75 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH75);
 
         #define DECODE_LIGHTING_STORE_1(px) do { \
             const uint16_t idx = packed_to_matcap_byte_index(p_ptr[(px)]); \
@@ -349,15 +349,16 @@ void decode_packed_cpu_lighting_interleaved8(const uint16_t *packed16,
             out_r75[(px)] = load_matcap_u32(matcap_rough75, idx); \
         } while (0)
 
+        //asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" ((void*)out_diff));
         DECODE_LIGHTING_STORE_1(0);
         DECODE_LIGHTING_STORE_1(1);
         DECODE_LIGHTING_STORE_1(2);
         DECODE_LIGHTING_STORE_1(3);
+        //asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" ((void*)(out_diff + 16)));
         DECODE_LIGHTING_STORE_1(4);
         DECODE_LIGHTING_STORE_1(5);
         DECODE_LIGHTING_STORE_1(6);
         DECODE_LIGHTING_STORE_1(7);
-
         #undef DECODE_LIGHTING_STORE_1
 
         p_ptr += DECODE_INTERLEAVED8_PIXELS;

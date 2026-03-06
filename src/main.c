@@ -16,11 +16,18 @@
 #define PIPELINE_BUFFERS 2
 #define BUFFER_W 320
 #define BUFFER_H 240
+#define EXPOSURE_MIN 0.0f
+#define EXPOSURE_MAX 200.0f
+#define EXPOSURE_STEP 0.5f
 
-#define HDRI_PATH "rom:/textures/courtyard"
+//#define HDRI_PATH "rom:/textures/courtyard"
+//#define HDRI_PATH "rom:/textures/ferndale_studio"
+//#define HDRI_PATH "rom:/textures/sunset"
 #define GBUFFER_ALBEDO_PATH "rom:/models/spheres_albedo.rgba16.sprite"
 #define GBUFFER_PACKED_PATH "rom:/models/spheres_packed.rgba16.sprite"
-
+#define HDRI_PATH "rom:/textures/courtyard"
+//#define GBUFFER_ALBEDO_PATH "rom:/models/buffer_albedo240.rgba16.sprite"
+//#define GBUFFER_PACKED_PATH "rom:/models/buffer_packed240.rgba16.sprite"
 #define MEASURE_RSP_PERF 1
 
 const uint16_t *sprite_pixels_u16(const sprite_t *spr)
@@ -51,14 +58,14 @@ static bool load_gbuffers_from_sprites(const char *albedo_path, const char *pack
 static void setup_default_lighting(LightingState *ls)
 {
     memset(ls, 0, sizeof(*ls));
-    ls->count = 0;
+    ls->count = 1;
 
     ls->dir[0][0] = 0.707f;
     ls->dir[0][1] = 0.577f;
     ls->dir[0][2] = 0.408f;
-    ls->color[0][0] = 1.0f;
-    ls->color[0][1] = 1.0f;
-    ls->color[0][2] = 1.0f;
+    ls->color[0][0] = 10.0f;
+    ls->color[0][1] = 6.0f;
+    ls->color[0][2] = 4.0f;
 
     ls->dir[1][0] = -0.4f;
     ls->dir[1][1] = 0.9f;
@@ -66,6 +73,9 @@ static void setup_default_lighting(LightingState *ls)
     ls->color[1][0] = 1.5f;
     ls->color[1][1] = 1.0f;
     ls->color[1][2] = 1.0f;
+
+    ls->exposure = 50.0f;
+    ls->hdri_brightness = 0.1f / 50.0f;
 }
 
 static inline float clampf_local(float v, float lo, float hi)
@@ -112,6 +122,7 @@ int main(void)
     asset_init_compression(2);
 
     dfs_init(DFS_DEFAULT_LOCATION);
+    joypad_init();
 
     display_init(RESOLUTION_320x240, DEPTH_16_BPP, FB_COUNT, GAMMA_CORRECT_DITHER, FILTERS_RESAMPLE_ANTIALIAS_DEDITHER);
     rdpq_init();
@@ -157,7 +168,7 @@ int main(void)
     for (int i = 0; i < PIPELINE_BUFFERS; i++) {
         decoded_lighting_surf[i] = surface_alloc(FMT_RGBA32, w, h * 3);
 
-        decoded_lighting[i] = UncachedAddr(decoded_lighting_surf[i].buffer);
+        decoded_lighting[i] = (decoded_lighting_surf[i].buffer);
 
         if (!decoded_lighting[i]) {
             debugf("decode buffers alloc failed\n");
@@ -192,6 +203,14 @@ int main(void)
     for (;;) {
         uint64_t t_frame0 = get_ticks_us();
         int slot = frame & (PIPELINE_BUFFERS - 1);
+        joypad_poll();
+
+        joypad_buttons_t held = joypad_get_buttons_held(JOYPAD_PORT_1);
+        if (held.c_up) {
+            lights.exposure = clampf_local(lights.exposure + EXPOSURE_STEP, EXPOSURE_MIN, EXPOSURE_MAX);
+        } else if (held.c_down) {
+            lights.exposure = clampf_local(lights.exposure - EXPOSURE_STEP, EXPOSURE_MIN, EXPOSURE_MAX);
+        }
 
         yaw += 0.06f;
         build_camera_from_yaw(yaw, &cam);
@@ -255,11 +274,12 @@ int main(void)
         uint64_t frame_us = t_frame1 - t_frame0;
         frame++;
         if ((frame % 30) == 0) {
-            debugf("matcap_generate_us=%llu decode_us=%llu rsp_submit_us=%llu frame_us=%llu\n",
+            debugf("matcap_generate_us=%llu decode_us=%llu rsp_submit_us=%llu frame_us=%llu exposure=%.3f\n",
                    (unsigned long long)mat_us,
                    (unsigned long long)dec_us,
                    (unsigned long long)rsp_submit_us,
-                   (unsigned long long)frame_us);
+                   (unsigned long long)frame_us,
+                   lights.exposure);
         }
     }
 

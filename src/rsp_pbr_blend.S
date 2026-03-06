@@ -131,20 +131,20 @@
 OVERLAY_CODE_START:
 
 PBRBlendCmd_SetGBuffer:
-  sw $a1, %lo(PACKED_SRC_RDRAM)($zero)
-  sw $a3, %lo(SRC_PIXELS_ITERATIONS)($zero)
-  sw $a0, %lo(ALBEDO_SRC_RDRAM)($zero)
-  j RSPQ_Loop
   sw $a2, %lo(DEST_SRC_RDRAM)($zero)
+  sw $a0, %lo(ALBEDO_SRC_RDRAM)($zero)
+  sw $a3, %lo(SRC_PIXELS_ITERATIONS)($zero)
+  j RSPQ_Loop
+  sw $a1, %lo(PACKED_SRC_RDRAM)($zero)
 PBRBlendCmd_SetLightingBuffers:
   j RSPQ_Loop
   sw $a0, %lo(LIGHTING_SRC_RDRAM)($zero)
 PBRBlendCmd_SetDitherMatrix:
+  sw $a1, %lo(DITHER_LINE_IN_BUFFERS)($zero)
   ori $s6, $zero, %lo(DITHER_MATRIX_8X2_1)
   mtc0 $s6, COP0_DMA_SPADDR
   mtc0 $a0, COP0_DMA_RAMADDR
   addiu $s7, $zero, 31
-  sw $a1, %lo(DITHER_LINE_IN_BUFFERS)($zero)
   mtc0 $s7, COP0_DMA_READ
   LABEL_PBRBlendCmd_SetDitherMatrix_0001:
   mfc0 $ra, COP0_DMA_BUSY
@@ -156,47 +156,47 @@ PBRBlendCmd_SetDitherMatrix:
 PBRBlendCmd_PostProcess:
   ori $s3, $zero, %lo(ALBEDO_BUF1)
   mtc0 $s3, COP0_DMA_SPADDR
+  ori $s0, $zero, %lo(DEST_BUF2)
   lw $s6, %lo(ALBEDO_SRC_RDRAM + 0)
   ori $s2, $zero, %lo(PACKED_BUF1)
-  addiu $sp, $zero, 191
+  lw $s5, %lo(PACKED_SRC_RDRAM + 0)
   mtc0 $s6, COP0_DMA_RAMADDR
+  addiu $sp, $zero, 191
   mtc0 $sp, COP0_DMA_READ
-  ori $s1, $zero, %lo(LIGHTING_BUF1)
   mtc0 $s2, COP0_DMA_SPADDR
   lw $s7, %lo(LIGHTING_SRC_RDRAM + 0)
-  lw $s5, %lo(PACKED_SRC_RDRAM + 0)
-  addiu $fp, $zero, 1
-  mtc0 $s5, COP0_DMA_RAMADDR
   lw $s4, %lo(DEST_SRC_RDRAM + 0)
-  addiu $k1, $zero, 1151
-  ori $s0, $zero, %lo(DEST_BUF2)
+  ori $s1, $zero, %lo(LIGHTING_BUF1)
+  mtc0 $s5, COP0_DMA_RAMADDR
   mtc0 $sp, COP0_DMA_READ
+  addiu $fp, $zero, 1
+  addiu $k1, $zero, 1151
   LABEL_PBRBlendCmd_PostProcess_0003:
   mfc0 $ra, COP0_DMA_BUSY
   bne $ra, $zero, LABEL_PBRBlendCmd_PostProcess_0003
   nop
   LABEL_PBRBlendCmd_PostProcess_0004:
+  vmov $v28.e1, $v30.e7
   addiu $at, $zero, 31744
+  mtc0 $s1, COP0_DMA_SPADDR
   mtc2 $at, $v28.e0
   addiu $at, $zero, 32767
-  mtc2 $at, $v28.e2
-  mtc0 $s1, COP0_DMA_SPADDR
-  vmov $v28.e1, $v30.e7
   mtc0 $s7, COP0_DMA_RAMADDR
-  mtc0 $k1, COP0_DMA_READ
+  mtc2 $at, $v28.e2
   vor $v27, $v00, $v28.e2
-  vxor $v26, $v00, $v30.e5
+  mtc0 $k1, COP0_DMA_READ
+  vxor $v26, $v00, $v31.e4
   postprocess_loop:
   lw $k0, %lo(SRC_PIXELS_ITERATIONS + 0)
   beq $k0, $zero, LABEL_PBRBlendCmd_PostProcess_0013
   nop
-  addiu $s7, $s7, 1152
-  addiu $s5, $s5, 192
-  ori $s2, $zero, %lo(PACKED_BUF2)
-  ori $s0, $zero, %lo(DEST_BUF2)
-  addiu $s6, $s6, 192
-  ori $s1, $zero, %lo(LIGHTING_BUF2)
   ori $s3, $zero, %lo(ALBEDO_BUF2)
+  addiu $s6, $s6, 192
+  ori $s0, $zero, %lo(DEST_BUF2)
+  addiu $s5, $s5, 192
+  addiu $s7, $s7, 1152
+  ori $s1, $zero, %lo(LIGHTING_BUF2)
+  ori $s2, $zero, %lo(PACKED_BUF2)
   LABEL_PBRBlendCmd_PostProcess_0006:
   mfc0 $ra, COP0_DMA_BUSY
   bne $ra, $zero, LABEL_PBRBlendCmd_PostProcess_0006
@@ -215,9 +215,8 @@ PBRBlendCmd_PostProcess:
   LABEL_PBRBlendCmd_PostProcess_0009:
   mtc0 $s1, COP0_DMA_SPADDR
   mtc0 $s7, COP0_DMA_RAMADDR
-  mtc0 $k1, COP0_DMA_READ
   bne $fp, $zero, LABEL_PBRBlendCmd_PostProcess_000A
-  nop
+  mtc0 $k1, COP0_DMA_READ
   mtc0 $s0, COP0_DMA_SPADDR
   mtc0 $s4, COP0_DMA_RAMADDR
   addiu $s4, $s4, 192
@@ -225,115 +224,131 @@ PBRBlendCmd_PostProcess:
   LABEL_PBRBlendCmd_PostProcess_000A:
   ori $at, $zero, %lo(DITHER_MATRIX_8X2_1)
   ori $s0, $zero, %lo(DEST_BUF1)
-  ori $k0, $zero, %lo(ALBEDO_BUF1)
-  ori $t7, $zero, %lo(LIGHTING_BUF1)
-  ori $s3, $zero, %lo(ALBEDO_BUF1)
-  or $fp, $zero, $zero
-  addiu $t7, $t7, 32
-  ori $t8, $zero, %lo(LIGHTING_BUF1)
   ori $s2, $zero, %lo(PACKED_BUF1)
-  ori $t4, $zero, %lo(LIGHTING_BUF1)
-  addiu $t4, $t4, 3
-  ori $t5, $zero, %lo(DEST_BUF1)
-  ori $t9, $zero, %lo(PACKED_BUF1)
-  ori $s1, $zero, %lo(LIGHTING_BUF1)
+  ori $t8, $zero, %lo(LIGHTING_BUF1)
+  ori $s3, $zero, %lo(ALBEDO_BUF1)
   ori $t6, $zero, %lo(LIGHTING_BUF1)
-  lqv $v25, 0, 0, $at
-  addiu $t6, $t6, 64
+  ori $t5, $zero, %lo(DEST_BUF1)
+  ori $t4, $zero, %lo(LIGHTING_BUF1)
   addiu $t3, $zero, 96
+  ori $t7, $zero, %lo(LIGHTING_BUF1)
+  ori $s1, $zero, %lo(LIGHTING_BUF1)
+  or $fp, $zero, $zero
+  lqv $v25, 0, 0, $at
+  addiu $t7, $t7, 32
+  addiu $t4, $t4, 3
+  ori $t9, $zero, %lo(PACKED_BUF1)
+  addiu $t6, $t6, 64
+  ori $k0, $zero, %lo(ALBEDO_BUF1)
   LABEL_PBRBlendCmd_PostProcess_000B:
   blez $t3, LABEL_PBRBlendCmd_PostProcess_000C
   nop
+  lqv $v24, 0, 0, $k0
   lqv $v23, 0, 0, $t9
   lfv $v15, 0, 0, $t8
   lfv $v15, 8, 16, $t8
-  lqv $v24, 0, 0, $k0
-  addiu $t3, $t3, 65528
-  vmudm $v19, $v23, $v31.e0
-  vand $v18, $v23, $v28.e1
-  addiu $t8, $t8, 1
-  lfv $v23, 0, 0, $t4
-  lfv $v12, 0, 0, $t7
-  vmudm $v22, $v24, $v31.e0
-  lfv $v12, 8, 16, $t7
   vmudn $v21, $v24, $v30.e3
-  lfv $v09, 0, 0, $t6
-  addiu $t7, $t7, 1
-  vmudh $v18, $v18, $v27.v
-  lfv $v09, 8, 16, $t6
-  vand $v22, $v22, $v28.e0
-  lfv $v14, 0, 0, $t8
-  lfv $v14, 8, 16, $t8
-  addiu $t6, $t6, 1
-  vand $v19, $v19, $v28.e0
-  lfv $v11, 0, 0, $t7
+  vmudm $v19, $v23, $v31.e0
+  lfv $v12, 0, 0, $t7
+  vand $v18, $v23, $v28.e1
+  lfv $v12, 8, 16, $t7
+  vmudm $v22, $v24, $v31.e0
   addiu $t8, $t8, 1
-  lfv $v11, 8, 16, $t7
-  lfv $v13, 0, 0, $t8
-  vmudn $v20, $v24, $v31.e6
-  lfv $v13, 8, 16, $t8
-  vmulf $v04, $v22, $v18.v
   addiu $t7, $t7, 1
-  vsub $v17, $v27, $v19.v
-  vsub $v16, $v27, $v18.v
-  lfv $v10, 0, 0, $t7
   vand $v21, $v21, $v28.e0
-  lfv $v08, 0, 0, $t6
-  vand $v20, $v20, $v28.e0
-  lfv $v23, 8, 16, $t4
-  lfv $v08, 8, 16, $t6
-  lfv $v10, 8, 16, $t7
-  vmulf $v05, $v22, $v16.v
+  lfv $v14, 0, 0, $t8
+  vand $v19, $v19, $v28.e0
+  lfv $v14, 8, 16, $t8
+  vmudn $v20, $v24, $v31.e6
+  addiu $t8, $t8, 1
+  lfv $v13, 0, 0, $t8
+  lfv $v09, 0, 0, $t6
+  vand $v22, $v22, $v28.e0
+  lfv $v11, 0, 0, $t7
+  lfv $v11, 8, 16, $t7
+  vmudh $v18, $v18, $v27.v
+  vsub $v17, $v27, $v19.v
+  addiu $t7, $t7, 1
+  lfv $v13, 8, 16, $t8
+  lfv $v09, 8, 16, $t6
+  vsub $v16, $v27, $v18.v
   addiu $t6, $t6, 1
+  vmulf $v04, $v22, $v18.v
+  lfv $v08, 0, 0, $t6
+  lfv $v10, 0, 0, $t7
+  vand $v20, $v20, $v28.e0
+  vmulf $v05, $v22, $v16.v
+  lfv $v10, 8, 16, $t7
+  lfv $v08, 8, 16, $t6
   vmulf $v03, $v09, $v19.v
-  lfv $v07, 0, 0, $t6
+  addiu $t6, $t6, 1
   vmacf $v03, $v12, $v17.v
-  vmulf $v06, $v04, $v03.v
+  lfv $v23, 0, 0, $t4
+  lfv $v23, 8, 16, $t4
+  lfv $v07, 0, 0, $t6
   lfv $v07, 8, 16, $t6
+  vmulf $v06, $v04, $v03.v
+  addiu $t9, $t9, 16
   vmacf $v06, $v05, $v15.v
-  addiu $t7, $t7, 94
   vmacf $v06, $v03, $v23.v
-  vmudh $v06, $v26, $v06.v
-  addiu $k0, $k0, 16
-  vmacf $v06, $v27, $v25.v
-  vmulf $v04, $v21, $v16.v
+  addiu $t4, $t4, 96
+  vmacf $v06, $v26, $v06.v
+  vsub $v06, $v27, $v06.v
+  addiu $t8, $t8, 94
+  addiu $t7, $t7, 94
   vmulf $v03, $v21, $v18.v
+  vmulf $v06, $v06, $v06.v
+  vmulf $v06, $v06, $v06.v
+  vmulf $v06, $v06, $v06.v
+  vmulf $v04, $v21, $v16.v
+  vsub $v06, $v27, $v06.v
+  vadd $v06, $v06, $v25.v
   vmulf $v02, $v08, $v19.v
   vmacf $v02, $v11, $v17.v
   vmulf $v05, $v03, $v02.v
   vmacf $v05, $v04, $v14.v
   vmacf $v05, $v02, $v23.v
-  vmudh $v05, $v26, $v05.v
-  vmacf $v05, $v27, $v25.v
+  vmacf $v05, $v26, $v05.v
   vmulf $v02, $v20, $v18.v
-  addiu $t4, $t4, 96
   vmulf $v03, $v20, $v16.v
+  vsub $v05, $v27, $v05.v
+  vmulf $v05, $v05, $v05.v
+  vmulf $v05, $v05, $v05.v
+  vmulf $v05, $v05, $v05.v
+  vsub $v05, $v27, $v05.v
+  addiu $t6, $t6, 94
+  vadd $v05, $v05, $v25.v
   vmulf $v01, $v07, $v19.v
   vmacf $v01, $v10, $v17.v
   vmulf $v04, $v02, $v01.v
   vmacf $v04, $v03, $v13.v
   vmacf $v04, $v01, $v23.v
-  vmudh $v04, $v26, $v04.v
-  vmacf $v04, $v27, $v25.v
-  vand $v05, $v05, $v28.e0
+  vmacf $v04, $v26, $v04.v
+  vsub $v04, $v27, $v04.v
   vand $v06, $v06, $v28.e0
+  addiu $t3, $t3, 65528
+  vmulf $v04, $v04, $v04.v
+  vmulf $v04, $v04, $v04.v
+  vmulf $v04, $v04, $v04.v
+  vsub $v04, $v27, $v04.v
+  vadd $v04, $v04, $v25.v
+  vand $v05, $v05, $v28.e0
+  vmudn $v06, $v06, $v30.e6
   vand $v04, $v04, $v28.e0
   vmudm $v05, $v05, $v31.e3
-  vmudn $v06, $v06, $v30.e6
   vmudm $v04, $v04, $v30.e0
-  addiu $t8, $t8, 94
   vor $v03, $v06, $v05.v
-  addiu $t6, $t6, 94
   vor $v03, $v03, $v04.v
   vor $v03, $v03, $v28.e1
-  addiu $t9, $t9, 16
+  addiu $k0, $k0, 16
   sqv $v03, 0, 0, $t5
-  j LABEL_PBRBlendCmd_PostProcess_000B
   addiu $t5, $t5, 16
+  j LABEL_PBRBlendCmd_PostProcess_000B
+  nop
   LABEL_PBRBlendCmd_PostProcess_000C:
   addiu $s6, $s6, 192
-  addiu $s5, $s5, 192
   addiu $s7, $s7, 1152
+  addiu $s5, $s5, 192
   LABEL_PBRBlendCmd_PostProcess_000D:
   mfc0 $ra, COP0_DMA_BUSY
   bne $ra, $zero, LABEL_PBRBlendCmd_PostProcess_000D
@@ -350,110 +365,125 @@ PBRBlendCmd_PostProcess:
   bne $ra, $zero, LABEL_PBRBlendCmd_PostProcess_000F
   nop
   LABEL_PBRBlendCmd_PostProcess_0010:
-  ori $t4, $zero, %lo(LIGHTING_BUF2)
   mtc0 $s1, COP0_DMA_SPADDR
+  ori $at, $zero, %lo(DITHER_MATRIX_8X2_2)
+  ori $t5, $zero, %lo(DEST_BUF2)
   mtc0 $s7, COP0_DMA_RAMADDR
+  mtc0 $k1, COP0_DMA_READ
+  ori $t8, $zero, %lo(LIGHTING_BUF2)
+  ori $t4, $zero, %lo(LIGHTING_BUF2)
+  mtc0 $s0, COP0_DMA_SPADDR
+  mtc0 $s4, COP0_DMA_RAMADDR
+  ori $t7, $zero, %lo(LIGHTING_BUF2)
+  ori $t6, $zero, %lo(LIGHTING_BUF2)
   ori $k0, $zero, %lo(ALBEDO_BUF2)
   ori $t9, $zero, %lo(PACKED_BUF2)
-  mtc0 $k1, COP0_DMA_READ
-  mtc0 $s0, COP0_DMA_SPADDR
-  ori $t5, $zero, %lo(DEST_BUF2)
-  ori $t6, $zero, %lo(LIGHTING_BUF2)
-  ori $at, $zero, %lo(DITHER_MATRIX_8X2_2)
-  ori $t8, $zero, %lo(LIGHTING_BUF2)
-  ori $t7, $zero, %lo(LIGHTING_BUF2)
-  mtc0 $s4, COP0_DMA_RAMADDR
-  addiu $s4, $s4, 192
-  addiu $t4, $t4, 3
-  addiu $t7, $t7, 32
-  lqv $v25, 0, 0, $at
   mtc0 $sp, COP0_DMA_WRITE
-  addiu $t6, $t6, 64
+  lqv $v25, 0, 0, $at
+  addiu $s4, $s4, 192
+  addiu $t7, $t7, 32
   addiu $t3, $zero, 96
+  addiu $t4, $t4, 3
+  addiu $t6, $t6, 64
   LABEL_PBRBlendCmd_PostProcess_0011:
   blez $t3, LABEL_PBRBlendCmd_PostProcess_0012
   nop
-  lqv $v24, 0, 0, $k0
   lqv $v23, 0, 0, $t9
+  lqv $v24, 0, 0, $k0
   lfv $v15, 0, 0, $t8
   lfv $v15, 8, 16, $t8
-  vmudn $v21, $v24, $v30.e3
-  vmudm $v22, $v24, $v31.e0
-  lfv $v12, 0, 0, $t7
-  lfv $v12, 8, 16, $t7
   vmudm $v19, $v23, $v31.e0
-  vand $v18, $v23, $v28.e1
-  lfv $v09, 0, 0, $t6
   addiu $t8, $t8, 1
-  lfv $v14, 0, 0, $t8
-  lfv $v09, 8, 16, $t6
+  vand $v18, $v23, $v28.e1
+  vmudn $v20, $v24, $v31.e6
+  lfv $v12, 0, 0, $t7
+  addiu $t3, $t3, 65528
+  vmudm $v22, $v24, $v31.e0
+  vmudn $v21, $v24, $v30.e3
+  lfv $v12, 8, 16, $t7
   vand $v19, $v19, $v28.e0
+  lfv $v14, 0, 0, $t8
+  lfv $v09, 0, 0, $t6
+  vand $v20, $v20, $v28.e0
   lfv $v23, 0, 0, $t4
-  lfv $v14, 8, 16, $t8
-  vmudh $v18, $v18, $v27.v
+  lfv $v23, 8, 16, $t4
   vand $v22, $v22, $v28.e0
+  addiu $k0, $k0, 16
+  vmudh $v18, $v18, $v27.v
   addiu $t7, $t7, 1
   vsub $v17, $v27, $v19.v
-  addiu $t6, $t6, 1
+  lfv $v09, 8, 16, $t6
+  lfv $v14, 8, 16, $t8
   lfv $v11, 0, 0, $t7
-  lfv $v11, 8, 16, $t7
-  vmudn $v20, $v24, $v31.e6
-  addiu $t7, $t7, 1
-  addiu $t8, $t8, 1
   vsub $v16, $v27, $v18.v
-  lfv $v13, 0, 0, $t8
-  vand $v20, $v20, $v28.e0
-  vand $v21, $v21, $v28.e0
-  lfv $v13, 8, 16, $t8
-  vmulf $v05, $v22, $v16.v
-  lfv $v10, 0, 0, $t7
-  vmulf $v04, $v22, $v18.v
+  lfv $v11, 8, 16, $t7
+  addiu $t6, $t6, 1
+  addiu $t8, $t8, 1
   lfv $v08, 0, 0, $t6
-  vmulf $v03, $v09, $v19.v
-  lfv $v23, 8, 16, $t4
+  vand $v21, $v21, $v28.e0
   lfv $v08, 8, 16, $t6
+  vmulf $v05, $v22, $v16.v
+  lfv $v13, 0, 0, $t8
+  vmulf $v04, $v22, $v18.v
+  lfv $v13, 8, 16, $t8
+  vmulf $v03, $v09, $v19.v
+  addiu $t6, $t6, 1
   vmacf $v03, $v12, $v17.v
+  addiu $t7, $t7, 1
+  lfv $v10, 0, 0, $t7
+  lfv $v10, 8, 16, $t7
   vmulf $v06, $v04, $v03.v
   vmacf $v06, $v05, $v15.v
-  addiu $t6, $t6, 1
   vmacf $v06, $v03, $v23.v
-  lfv $v10, 8, 16, $t7
-  vmudh $v06, $v26, $v06.v
   lfv $v07, 0, 0, $t6
-  vmacf $v06, $v27, $v25.v
   lfv $v07, 8, 16, $t6
-  addiu $t3, $t3, 65528
+  vmacf $v06, $v26, $v06.v
   vmulf $v04, $v21, $v16.v
+  vsub $v06, $v27, $v06.v
   vmulf $v03, $v21, $v18.v
+  addiu $t9, $t9, 16
+  vmulf $v06, $v06, $v06.v
+  vmulf $v06, $v06, $v06.v
+  vmulf $v06, $v06, $v06.v
+  vsub $v06, $v27, $v06.v
+  vadd $v06, $v06, $v25.v
   vmulf $v02, $v08, $v19.v
   vmacf $v02, $v11, $v17.v
   vmulf $v05, $v03, $v02.v
   vmacf $v05, $v04, $v14.v
   vmacf $v05, $v02, $v23.v
-  vmudh $v05, $v26, $v05.v
-  vmacf $v05, $v27, $v25.v
+  vmacf $v05, $v26, $v05.v
   vmulf $v02, $v20, $v18.v
+  vsub $v05, $v27, $v05.v
+  vmulf $v05, $v05, $v05.v
   vmulf $v03, $v20, $v16.v
+  vmulf $v05, $v05, $v05.v
+  vmulf $v05, $v05, $v05.v
+  vsub $v05, $v27, $v05.v
+  vadd $v05, $v05, $v25.v
   vmulf $v01, $v07, $v19.v
   vmacf $v01, $v10, $v17.v
   vmulf $v04, $v02, $v01.v
   vmacf $v04, $v03, $v13.v
   vmacf $v04, $v01, $v23.v
-  vmudh $v04, $v26, $v04.v
-  vmacf $v04, $v27, $v25.v
-  vand $v05, $v05, $v28.e0
+  vmacf $v04, $v26, $v04.v
+  vsub $v04, $v27, $v04.v
+  vmulf $v04, $v04, $v04.v
+  vmulf $v04, $v04, $v04.v
   vand $v06, $v06, $v28.e0
-  vand $v04, $v04, $v28.e0
-  vmudm $v05, $v05, $v31.e3
-  addiu $t9, $t9, 16
+  vmulf $v04, $v04, $v04.v
+  vand $v05, $v05, $v28.e0
   vmudn $v06, $v06, $v30.e6
-  addiu $t7, $t7, 94
+  vsub $v04, $v27, $v04.v
+  vadd $v04, $v04, $v25.v
+  vmudm $v05, $v05, $v31.e3
+  vand $v04, $v04, $v28.e0
+  vor $v03, $v06, $v05.v
   vmudm $v04, $v04, $v30.e0
   addiu $t6, $t6, 94
-  vor $v03, $v06, $v05.v
-  addiu $k0, $k0, 16
-  addiu $t4, $t4, 96
   vor $v03, $v03, $v04.v
+  addiu $t4, $t4, 96
+  addiu $t7, $t7, 94
   vor $v03, $v03, $v28.e1
   addiu $t8, $t8, 94
   sqv $v03, 0, 0, $t5
@@ -462,9 +492,8 @@ PBRBlendCmd_PostProcess:
   LABEL_PBRBlendCmd_PostProcess_0012:
   lw $t2, %lo(SRC_PIXELS_ITERATIONS + 0)
   addiu $t2, $t2, 65534
-  sw $t2, %lo(SRC_PIXELS_ITERATIONS)($zero)
   j postprocess_loop
-  nop
+  sw $t2, %lo(SRC_PIXELS_ITERATIONS)($zero)
   LABEL_PBRBlendCmd_PostProcess_0013:
   mfc0 $ra, COP0_DMA_BUSY
   bne $ra, $zero, LABEL_PBRBlendCmd_PostProcess_0013
