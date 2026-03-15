@@ -2,5 +2,6 @@
 #define RSP_BLEND_CONSTANTS_H
 
 #define ASSERT_INVALID_WIDTH   0x0101
+#define BUFFER_PIXELS 96
 
 #endif

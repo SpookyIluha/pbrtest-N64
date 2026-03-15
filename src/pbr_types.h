@@ -17,6 +17,7 @@ typedef struct{
 } float_color_t;
 
 typedef struct {
+    // u3.5 HDR RGB, 1.0 == 64
     uint8_t c[4];
 } matcap_color_t;
 
@@ -24,23 +25,25 @@ typedef struct {
     int w;
     int h;
     matcap_color_t *diffuse;
-    matcap_color_t *rough25;
-    matcap_color_t *rough75;
+    matcap_color_t *spec25;
+    matcap_color_t *spec75;
 } MatcapSet;
 
 typedef struct {
-    /* Keep legacy layout first for object compatibility. */
-    int w;
-    int h;
+
     hdri_color_t *diffuse;
-    hdri_color_t *rough25;
-    hdri_color_t *rough75;
+    hdri_color_t *spec25;
+    hdri_color_t *spec75;
     int diffuse_w;
     int diffuse_h;
-    int rough25_w;
-    int rough25_h;
-    int rough75_w;
-    int rough75_h;
+    int spec25_w;
+    int spec25_h;
+    int spec75_w;
+    int spec75_h;
+    /* Interleaved specular texels: [s25_rgb, s75_rgb, s25_rgb, s75_rgb, ...]. */
+    hdri_color_t *specular_interleaved;
+    int specular_w;
+    int specular_h;
 } HDRISet;
 
 typedef struct {
@@ -51,8 +54,9 @@ typedef struct {
     int count;
     float dir[4][3];
     float color[4][3];
-    float hdri_brightness;
-    
+
+    float hdri_strength;
+    float emission_strength;
     float exposure;
 } LightingState;
 

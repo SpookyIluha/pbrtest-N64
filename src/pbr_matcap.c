@@ -14,20 +14,21 @@
 #define INV_MATCAP_W (1.0f / (float)MATCAP_W)
 #define INV_MATCAP_H (1.0f / (float)MATCAP_H)
 
+#define COLOR_COMPONENTS 3
+#define MATCAP_COUNT 3
+
 static uint8_t g_fresnel_mask_u8[MATCAP_TEXELS];
 static bool g_fresnel_masks_init = false;
-static int g_hdri_sample_w = 0;
-static int g_hdri_sample_h = 0;
 
 static inline void set_hdr_const(hdri_color_t *dst, uint16_t v)
 {
-    for(int i = 0; i < 3; i++)
+    for(int i = 0; i < COLOR_COMPONENTS; i++)
         dst->c[i] = v;
 }
 
 static inline void set_matcap_const(matcap_color_t* dst, uint8_t rgb, uint8_t a)
 {
-    for(int i = 0; i < 3; i++)
+    for(int i = 0; i < COLOR_COMPONENTS; i++)
         dst->c[i] = rgb;
     dst->c[3] = a;
 }
@@ -40,10 +41,10 @@ bool alloc_matcaps(MatcapSet *m)
 
     size_t texels = (size_t)m->w * (size_t)m->h;
     m->diffuse = malloc(sizeof(matcap_color_t) * texels);
-    m->rough25 = malloc(sizeof(matcap_color_t) * texels);
-    m->rough75 = malloc(sizeof(matcap_color_t) * texels);
+    m->spec25 = malloc(sizeof(matcap_color_t) * texels);
+    m->spec75 = malloc(sizeof(matcap_color_t) * texels);
 
-    if (!m->diffuse || !m->rough25 || !m->rough75) {
+    if (!m->diffuse || !m->spec25 || !m->spec75) {
         free_matcaps(m);
         return false;
     }
@@ -54,11 +55,11 @@ void free_matcaps(MatcapSet *m)
 {
     if (!m) return;
     free(m->diffuse);
-    free(m->rough25);
-    free(m->rough75);
+    free(m->spec25);
+    free(m->spec75);
     m->diffuse = NULL;
-    m->rough25 = NULL;
-    m->rough75 = NULL;
+    m->spec25 = NULL;
+    m->spec75 = NULL;
     m->w = 0;
     m->h = 0;
 }
@@ -84,72 +85,69 @@ static inline int clamp_y(int y, int h)
     return y;
 }
 
-static inline float fast_acosf(float x)
+static inline void  dir_to_paraboloid_uv(const fm_vec3_t *dir, float *u, float *v)
 {
-    x = clampf_local(x, -1.0f, 1.0f);
-    float res = -0.6981317f * x;
-    res *= x;
-    res -= 0.8726646f;
-    res *= x;
-    res += 1.5707963f;
-    return res;
-}
-
-static inline void dir_to_equirect_uv(const fm_vec3_t *dir, float *u, float *v)
-{
-    *u = fm_atan2f(dir->z, dir->x) * HALF_INV_PI_F + 0.5f;
-    *v = fast_acosf(dir->y) * INV_PI_F;
-}
-
-static inline void dir_to_octa(const fm_vec3_t *dir, float *u, float *v)
-{
-    float invL1 = 1.0f / (fabsf(dir->x) + fabsf(dir->y) + fabsf(dir->z));
-
-    float x = dir->x * invL1;
-    float y = dir->y * invL1;
-    float z = dir->z * invL1;
-
-    if (z < 0.0f)
-    {
-        float oldX = x;
-        x = (1.0f - fabsf(y)) * (oldX >= 0.0f ? 1.0f : -1.0f);
-        y = (1.0f - fabsf(oldX)) * (y >= 0.0f ? 1.0f : -1.0f);
-    }
-
-    *u = x * 0.5f + 0.5f;
-    *v = y * 0.5f + 0.5f;
-}
-
-static inline void  dual_paraboloid_project(const fm_vec3_t *dir, float *u, float *v)
-{
-    register float m;
+    float m;
+    float uu, vv;
 
     if (dir->z >= 0.0f)
     {
+        // front hemisphere
         m = 1.0f / (1.0f + dir->z);
 
-        *u = 0.5f * (dir->x * m + 1.0f);
-        *v = 0.5f * (dir->y * m + 1.0f);
+        uu = 0.5f * (dir->x * m + 1.0f);
+        vv = 0.5f * (-dir->y * m + 1.0f);
+
+        *u = uu * 0.5f  + 0.5;
+        *v = vv;
     }
     else
     {
+        // back hemisphere
         m = 1.0f / (1.0f - dir->z);
 
-        *u = 0.5f * (dir->x * m + 1.0f);
-        *v = 0.5f * (-dir->y * m + 1.0f);
+        uu = 0.5f * (-dir->x * m + 1.0f);
+        vv = 0.5f * (dir->y * m + 1.0f);
+
+        *u = uu * 0.5f;
+        *v = vv;
     }
 }
 
-static inline void hdri_sample_equirect_nearest(const hdri_color_t *img, float u, float v, hdri_color_t *out_rgb)
+static inline void hdri_sample_equirect_nearest(const hdri_color_t *img,
+                                                int w,
+                                                int h,
+                                                float u,
+                                                float v,
+                                                hdri_color_t *out_rgb)
 {
-    if (!img || g_hdri_sample_w <= 0 || g_hdri_sample_h <= 0) {
+    if (!img || w <= 0 || h <= 0) {
         set_hdr_const(out_rgb, U88_ONE);
         return;
     }
 
-    int ix = wrap_x((int)(u * (float)g_hdri_sample_w), g_hdri_sample_w);
-    int iy = clamp_y((int)(v * (float)g_hdri_sample_h), g_hdri_sample_h);
-    *out_rgb = img[(size_t)iy * (size_t)g_hdri_sample_w + (size_t)ix];
+    int ix = wrap_x((int)(u * (float)w), w);
+    int iy = clamp_y((int)(v * (float)h), h);
+    *out_rgb = img[(size_t)iy * (size_t)w + (size_t)ix];
+}
+
+static inline void hdri_sample_specular_pair_equirect_nearest(const HDRISet *hdri,
+                                                               float u,
+                                                               float v,
+                                                               hdri_color_t *out_s25,
+                                                               hdri_color_t *out_s75)
+{
+    if (!hdri || !hdri->specular_interleaved || hdri->specular_w <= 0 || hdri->specular_h <= 0) {
+        set_hdr_const(out_s25, U88_ONE);
+        set_hdr_const(out_s75, U88_ONE);
+        return;
+    }
+
+    int ix = wrap_x((int)(u * (float)hdri->specular_w), hdri->specular_w);
+    int iy = clamp_y((int)(v * (float)hdri->specular_h), hdri->specular_h);
+    size_t base = ((size_t)iy * (size_t)hdri->specular_w + (size_t)ix) * 2u;
+    *out_s25 = hdri->specular_interleaved[base + 0u];
+    *out_s75 = hdri->specular_interleaved[base + 1u];
 }
 
 static inline void rotate_y(fm_vec3_t *v, float cos_a, float sin_a)
@@ -174,8 +172,9 @@ static inline fm_vec3_t reflect_view_about_normal(const fm_vec3_t *n_view)
 static inline bool compute_forward_view(int x, int y, fm_vec3_t *out)
 {
     // Transposed matcap layout (16x32): normal.y maps to texel X, normal.x maps to texel Y.
+    int x_flip = (MATCAP_W - 1) - x;
     float nx = ((float)y + 0.5f) * INV_MATCAP_H * 2.0f - 1.0f;
-    float ny = 1.0f - (((float)x + 0.5f) * INV_MATCAP_W * 2.0f);
+    float ny = 1.0f - (((float)x_flip + 0.5f) * INV_MATCAP_W * 2.0f);
     float rr = nx * nx + ny * ny;
     if (rr > 1.0f) {
         *out = (fm_vec3_t){{0.0f, 0.0f, 1.0f}};
@@ -196,7 +195,7 @@ static void init_fresnel_masks(float f0)
             fm_vec3_t forward_view;
             bool valid = compute_forward_view(x, y, &forward_view);
             if (!valid) {
-                g_fresnel_mask_u8[idx] = 0;
+                g_fresnel_mask_u8[idx] = 255;
                 continue;
             }
 
@@ -213,23 +212,14 @@ static void init_fresnel_masks(float f0)
     g_fresnel_masks_init = true;
 }
 
-void build_camera_from_yaw(float yaw, CameraState *cam)
-{
-    fm_vec3_t f = {{fm_cosf(yaw), 0.0f, fm_sinf(yaw)}};
-    fm_vec3_norm(&f, &f);
-    cam->forward[0] = f.x;
-    cam->forward[1] = f.y;
-    cam->forward[2] = f.z;
-}
-
 // function to evaluate a GGX light intensity
-// returns the vector of light intensity where each component is {roughness0, roughness1, diffuse}
+// returns the vector of light intensity where each component is {diffuse, specness0, specness1}
 // N - normal vector
 // V - view vector
 // L - light vector
-// roughness - array of roughness values
+// specness - array of specness values
 // out - output vector
-static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t *L, const float roughness[2], fm_vec3_t *out)
+static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t *L, const float specness[2], fm_vec3_t *out)
 {
     for(int i = 0; i < 3; i++)
         out->v[i] = 0.0f;
@@ -238,7 +228,7 @@ static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t 
     float NdotL = fm_vec3_dot(N, L);
     if (NdotV <= 0.0f || NdotL <= 0.0f) return;
 
-    out->z = NdotL;
+    out->x = NdotL;
 
     fm_vec3_t H;
     fm_vec3_add(&H, V, L);
@@ -248,14 +238,14 @@ static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t 
     float invLenH = 1.0f / sqrtf(lenH2);
     float NdotH = clampf_local(fm_vec3_dot(N, &H) * invLenH, 0.0f, 1.0f);
 
-    for (int i = 0; i < 2; i++) {
-        float a = roughness[i] * roughness[i];
+    for (int i = 0; i < 2; ) {
+        float a = specness[i] * specness[i];
         float a2 = a * a;
         float NdotH2 = NdotH * NdotH;
         float denom = NdotH2 * (a2 - 1.0f) + 1.0f;
         float D = a2 / (PI_F * denom * denom + 1e-6f);
 
-        float k = roughness[i] + 1.0f;
+        float k = specness[i] + 1.0f;
         k = (k * k) * 0.125f;
 
         float Gv = NdotV / (NdotV * (1.0f - k) + k);
@@ -264,6 +254,7 @@ static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t 
 
         float brdf = (D * G) / (4.0f * NdotV * NdotL + 1e-6f);
         float lit = brdf * NdotL;
+        i++;
         out->v[i] = lit;
     }
 }
@@ -271,45 +262,93 @@ static void EvaluateGGX(const fm_vec3_t *N, const fm_vec3_t *V, const fm_vec3_t 
 void generate_matcaps(const CameraState *cam, const LightingState *lights, const HDRISet *hdri, MatcapSet *out)
 {
     LightingState lightingstate = *lights;
-    init_fresnel_masks(FRESNEL_F0_DEFAULT);
-    g_hdri_sample_w = hdri ? hdri->w : 0;
-    g_hdri_sample_h = hdri ? hdri->h : 0;
+    float exposure, hdri_strength, emission_strength;
+    // RGB is u3.5, so 1.0 == 64.
+    exposure = lightingstate.exposure * (64.0f);
+    hdri_strength = lightingstate.hdri_strength * (1.0f / 8.0f / 64.0f);
+    emission_strength = lightingstate.emission_strength * lightingstate.exposure * (64.0f);
 
-    float yaw = fm_atan2f(cam->forward[2], cam->forward[0]);
-    float sin_yaw, cos_yaw;
-    fm_sincosf(yaw, &sin_yaw, &cos_yaw);
+    init_fresnel_masks(FRESNEL_F0_DEFAULT);
+    matcap_color_t *out_maps[3] = {out->diffuse, out->spec25, out->spec75};
+
+    fm_vec3_t cam_forward = {{
+        cam->forward[0],
+        -cam->forward[1],
+        cam->forward[2]
+    }};
+    fm_vec3_norm(&cam_forward, &cam_forward);
+
+    fm_vec3_t world_up = {{0.0f, 1.0f, 0.0f}};
+    fm_vec3_t cam_right;
+    fm_vec3_cross(&cam_right, &world_up, &cam_forward);
+    fm_vec3_norm(&cam_right, &cam_right);
+
+    fm_vec3_t cam_up;
+    fm_vec3_cross(&cam_up, &cam_forward, &cam_right);
 
     const fm_vec3_t V = {{0.0f, 0.0f, 1.0f}};
-    const float roughness[2] = {0.25f, 0.75f};
+    const float specness[2] = {0.25f, 0.75f};
     int light_count = lights ? lights->count : 0;
     if (light_count > 4) light_count = 4;
 
-    matcap_color_t outside_diffuse_px = {{0u, 0u, 0u, 0u}};
-    matcap_color_t outside_rough25_px = {{0u, 0u, 0u, 0u}};
-    matcap_color_t outside_rough75_px = {{0u, 0u, 0u, 0u}};
+    matcap_color_t outside_px[3] = {0};
     // compute one color for pixels outside the RR, we assume that the direction for them is -forward
     {
         fm_vec3_t outside_dir_env = {{
-            -cam->forward[0],
-            -cam->forward[1],
-            -cam->forward[2]
+            -cam_forward.x,
+            -cam_forward.y,
+            -cam_forward.z
         }};
         fm_vec3_norm(&outside_dir_env, &outside_dir_env);
 
-        float u_out, v_out;
-        dir_to_equirect_uv(&outside_dir_env, &u_out, &v_out);
+        float u_diff = 0, v_diff = 0;
 
-        hdri_color_t outside_diff_u88;
-        hdri_color_t outside_r25_u88;
-        hdri_color_t outside_r75_u88;
-        hdri_sample_equirect_nearest(hdri->diffuse, u_out, v_out, &outside_diff_u88);
-        hdri_sample_equirect_nearest(hdri->rough25, u_out, v_out, &outside_r25_u88);
-        hdri_sample_equirect_nearest(hdri->rough75, u_out, v_out, &outside_r75_u88);
+        // paraboloid is not exactly equirectangular, but at 16x32 it's close enough, and its a lot faster
+        dir_to_paraboloid_uv(&outside_dir_env, &u_diff, &v_diff);
 
-        for (int c = 0; c < 3; c++) {
-            outside_diffuse_px.c[c] = (uint8_t)fminf(outside_diff_u88.c[c] * lights->exposure, 255.0f);
-            outside_rough25_px.c[c] = (uint8_t)fminf(outside_r25_u88.c[c] * lights->exposure, 255.0f);
-            outside_rough75_px.c[c] = (uint8_t)fminf(outside_r75_u88.c[c] * lights->exposure, 255.0f);
+        // {diffuse, s25, s75}
+        float_color_t totals[3] = {0};
+        hdri_color_t hdri_values[3] = {0};
+
+        hdri_sample_equirect_nearest(hdri->diffuse, hdri->diffuse_w, hdri->diffuse_h, u_diff, v_diff, &hdri_values[0]);
+        hdri_sample_specular_pair_equirect_nearest(hdri, u_diff, v_diff, &hdri_values[1], &hdri_values[2]);
+
+        for(int k = 0; k < MATCAP_COUNT; k++) {
+            for (int c = 0; c < COLOR_COMPONENTS; c++) {
+                totals[k].c[c] = hdri_values[k].c[c] * hdri_strength;
+            }
+        }
+
+        for (int li = 0; li < light_count; li++) {
+            fm_vec3_t L_world = {{
+                lightingstate.dir[li][0],
+                lightingstate.dir[li][1],
+                lightingstate.dir[li][2]
+            }};
+            fm_vec3_norm(&L_world, &L_world);
+
+            fm_vec3_t L_view = {{
+                fm_vec3_dot(&L_world, &cam_right),
+                fm_vec3_dot(&L_world, &cam_up),
+                fm_vec3_dot(&L_world, &cam_forward)
+            }};
+
+            fm_vec3_t ggx;
+            EvaluateGGX(&(fm_vec3_t){{0.0f, 0.0f, 1.0f}}, &V, &L_view, specness, &ggx);
+            if (ggx.z <= 0.0f) continue;
+
+            for(int k = 0; k < MATCAP_COUNT; k++) {
+                for (int c = 0; c < COLOR_COMPONENTS; c++) {
+                    totals[k].c[c] += (lightingstate.color[li][c] * ggx.v[k]);
+                }
+            }
+        }
+
+        for(int k = 0; k < MATCAP_COUNT; k++) {
+            for (int c = 0; c < COLOR_COMPONENTS; c++) {
+                totals[k].c[c] = fminf(totals[k].c[c] * 8 * exposure, 255.0f);
+                outside_px[k].c[c] = (uint8_t)(totals[k].c[c]);
+            }
         }
     }
 
@@ -319,78 +358,86 @@ void generate_matcaps(const CameraState *cam, const LightingState *lights, const
 
             fm_vec3_t forward_view;
             if (!compute_forward_view(x, y, &forward_view)) {
-                out->diffuse[idx] = outside_diffuse_px;
-                out->rough25[idx] = outside_rough25_px;
-                out->rough75[idx] = outside_rough75_px;
+                for (int m = 0; m < MATCAP_COUNT; m++) {
+                    out_maps[m][idx] = outside_px[m];
+                }
                 continue;
             }
 
-            fm_vec3_t diffuse_dir_env = forward_view;
-            rotate_y(&diffuse_dir_env, cos_yaw, sin_yaw);
+            fm_vec3_t diffuse_dir_env = {{
+                cam_right.x * forward_view.x + cam_up.x * forward_view.y + cam_forward.x * forward_view.z,
+                cam_right.y * forward_view.x + cam_up.y * forward_view.y + cam_forward.y * forward_view.z,
+                cam_right.z * forward_view.x + cam_up.z * forward_view.y + cam_forward.z * forward_view.z
+            }};
 
             fm_vec3_t spec_dir_view = reflect_view_about_normal(&forward_view);
-            fm_vec3_t spec_dir_env = spec_dir_view;
-            rotate_y(&spec_dir_env, cos_yaw, sin_yaw);
+            fm_vec3_t spec_dir_env = {{
+                cam_right.x * spec_dir_view.x + cam_up.x * spec_dir_view.y + cam_forward.x * spec_dir_view.z,
+                cam_right.y * spec_dir_view.x + cam_up.y * spec_dir_view.y + cam_forward.y * spec_dir_view.z,
+                cam_right.z * spec_dir_view.x + cam_up.z * spec_dir_view.y + cam_forward.z * spec_dir_view.z
+            }};
 
             float u_diff = 0, v_diff = 0;
             float u_spec = 0, v_spec = 0;
-            dual_paraboloid_project(&diffuse_dir_env, &u_diff, &v_diff);
-            dual_paraboloid_project(&spec_dir_env, &u_spec, &v_spec);
 
-            float_color_t total_diffuse = {0};
-            float_color_t total_s25 = {0};
-            float_color_t total_s75 = {0};
-            hdri_color_t hdri_diffuse = {0};
-            hdri_color_t hdri_rough25 = {0};
-            hdri_color_t hdri_rough75 = {0};
-            hdri_sample_equirect_nearest(hdri->diffuse, u_diff, v_diff, &hdri_diffuse);
-            hdri_sample_equirect_nearest(hdri->rough25, u_spec, v_spec, &hdri_rough25);
-            hdri_sample_equirect_nearest(hdri->rough75, u_spec, v_spec, &hdri_rough75);
+            // paraboloid is not exactly equirectangular, but at 16x32 it's close enough, and its a lot faster
+            dir_to_paraboloid_uv(&diffuse_dir_env, &u_diff, &v_diff);
+            dir_to_paraboloid_uv(&spec_dir_env, &u_spec, &v_spec);
 
-            for (int c = 0; c < 3; c++) {
-                total_diffuse.c[c] = hdri_diffuse.c[c] * lightingstate.hdri_brightness;
-                total_s25.c[c] = hdri_rough25.c[c] * lightingstate.hdri_brightness;
-                total_s75.c[c] = hdri_rough75.c[c] * lightingstate.hdri_brightness;
+            // {diffuse, s25, s75}
+            float_color_t totals[3] = {0};
+            hdri_color_t hdri_values[3] = {0};
+
+            hdri_sample_equirect_nearest(hdri->diffuse, hdri->diffuse_w, hdri->diffuse_h, u_diff, v_diff, &hdri_values[0]);
+            hdri_sample_specular_pair_equirect_nearest(hdri, u_spec, v_spec, &hdri_values[1], &hdri_values[2]);
+
+            for(int k = 0; k < MATCAP_COUNT; k++) {
+                for (int c = 0; c < COLOR_COMPONENTS; c++) {
+                    totals[k].c[c] = hdri_values[k].c[c] * hdri_strength;
+                }
             }
 
             for (int li = 0; li < light_count; li++) {
-                fm_vec3_t L = {{
+                fm_vec3_t L_world = {{
                     lightingstate.dir[li][0],
                     lightingstate.dir[li][1],
                     lightingstate.dir[li][2]
                 }};
+                fm_vec3_norm(&L_world, &L_world);
+
+                fm_vec3_t L_view = {{
+                    fm_vec3_dot(&L_world, &cam_right),
+                    fm_vec3_dot(&L_world, &cam_up),
+                    fm_vec3_dot(&L_world, &cam_forward)
+                }};
 
                 fm_vec3_t ggx;
-                EvaluateGGX(&forward_view, &V, &L, roughness, &ggx);
+                EvaluateGGX(&forward_view, &V, &L_view, specness, &ggx);
                 if (ggx.z <= 0.0f) continue;
 
-                for (int c = 0; c < 3; c++) {
-                    total_diffuse.c[c] += (lightingstate.color[li][c] * ggx.z);
-                    total_s25.c[c] += (lightingstate.color[li][c] * ggx.x);
-                    total_s75.c[c] += (lightingstate.color[li][c] * ggx.y);
+                for(int k = 0; k < MATCAP_COUNT; k++) {
+                    for (int c = 0; c < COLOR_COMPONENTS; c++) {
+                        totals[k].c[c] += (lightingstate.color[li][c] * ggx.v[k]);
+                    }
                 }
             }
 
-            for (int c = 0; c < 3; c++) {
-                total_diffuse.c[c] = fminf(total_diffuse.c[c] * lightingstate.exposure, 255.0f);
-                total_s25.c[c] = fminf(total_s25.c[c] * lightingstate.exposure, 255.0f);
-                total_s75.c[c] = fminf(total_s75.c[c] * lightingstate.exposure, 255.0f);
+            for(int k = 0; k < MATCAP_COUNT; k++) {
+                for (int c = 0; c < COLOR_COMPONENTS; c++) {
+                    totals[k].c[c] = fminf(totals[k].c[c] * exposure, 255.0f);
+                    out_maps[k][idx].c[c] = (uint8_t)(totals[k].c[c]);
+                }
             }
-
-            uint8_t fres_u8 = g_fresnel_mask_u8[idx];
-
-            for (int c = 0; c < 3; c++) {
-                out->diffuse[idx].c[c] = (uint8_t)(total_diffuse.c[c]);
-                out->rough25[idx].c[c] = (uint8_t)(total_s25.c[c]);
-                out->rough75[idx].c[c] = (uint8_t)(total_s75.c[c]);
-            }
-            out->diffuse[idx].c[3] = fres_u8;
+            // alpha of the diffuse is the fresnel coefficient from f0 to 255=1.0 on the edges
+            out_maps[0][idx].c[3] = g_fresnel_mask_u8[idx];
         }
     }
 
-    // (0,0) is used as the emission/passthrough texel when packed roughness is zero.
-    // RGB is u3.5, so 1.0 == 64.
-    set_matcap_const(&out->diffuse[0], 64u, 0u);
-    set_matcap_const(&out->rough25[0], 0u, 0u);
-    set_matcap_const(&out->rough75[0], 0u, 0u);
+    // (0,0) is used as the emission/passthspec texel when the packed normal is zero.
+
+    uint8_t emission = (uint8_t)fminf(emission_strength, 255.0f);
+    set_matcap_const(&out->diffuse[0], emission, 0u);
+    set_matcap_const(&out->spec25[0], 0u, 0u);
+    set_matcap_const(&out->spec75[0], 0u, 0u);
+
 }

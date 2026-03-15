@@ -18,7 +18,7 @@ static void rsp_pbr_blend_assert_handler(rsp_snapshot_t *state, uint16_t code);
 enum {
     // Overlay commands. This must match the command table in the RSP code
     RSP_PBR_BLEND_CMD_SET_GBUFFER = 0x0,
-    RSP_PBR_BLEND_CMD_SET_LIGHTINGBUFFERS = 0x1,
+    RSP_PBR_BLEND_CMD_SET_LIGHTING_BUFFERS = 0x1,
     RSP_PBR_BLEND_CMD_SET_DITHER_MATRIX = 0x2,
     RSP_PBR_BLEND_CMD_POSTPROCESS = 0x3
 };
@@ -60,12 +60,6 @@ void rsp_pbr_blend_init(void) {
 }
 
 void rsp_pbr_blend_assert_handler(rsp_snapshot_t *state, uint16_t code) {
-    switch (code) {
-    case ASSERT_INVALID_WIDTH:
-        printf("Invalid surface width (%ld)\nMust be multiple of 8 and less than 640\n",
-            state->gpr[8]); // read current width from t0 (reg #8): we know it's there at assert point
-        return;
-    }
     assertf(0, "PBR Blend crashed with code %i", code);
 }
 
@@ -79,17 +73,17 @@ void rsp_pbr_blend_set_gbuffer(const surface_t *albedo, const surface_t *packed,
     assertf((packed->width == albedo->width) && (packed->height == albedo->height), "Mismatched PBR buffer sizes");
     assertf((destination->width == albedo->width) && (destination->height == albedo->height), "Mismatched output buffer sizes");
     size_t pixels = albedo->width * albedo->height;
-    assertf(pixels % (96*2) == 0, "Surface buffer's pixel count must be multiple of 192");
+    assertf(pixels % (BUFFER_PIXELS*2) == 0, "Surface buffer's pixel count must be multiple of %i", (BUFFER_PIXELS*2));
 
     rspq_write(ovl_id, RSP_PBR_BLEND_CMD_SET_GBUFFER, PhysicalAddr(albedo->buffer), PhysicalAddr(packed->buffer),
-        PhysicalAddr(destination->buffer), (uint32_t)(pixels / 96));
+        PhysicalAddr(destination->buffer), (uint32_t)(pixels / BUFFER_PIXELS));
 }
 
-void rsp_pbr_blend_set_lighting_buffer(const surface_t *lighting) {
+void rsp_pbr_blend_set_lighting_buffers(const surface_t *lighting) {
     assertf(lighting != NULL, "Nullptr Lighting buffer");
     assertf(surface_get_format(lighting) == FMT_RGBA32, "rsp_pbr_blend lighting buffers must be RGBA32");
 
-    rspq_write(ovl_id, RSP_PBR_BLEND_CMD_SET_LIGHTINGBUFFERS, 
+    rspq_write(ovl_id, RSP_PBR_BLEND_CMD_SET_LIGHTING_BUFFERS, 
         PhysicalAddr(lighting->buffer));
 }
 

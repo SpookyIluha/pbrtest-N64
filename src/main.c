@@ -1,5 +1,7 @@
 #include <libdragon.h>
 #include <t3d/t3d.h>
+#include <t3d/t3dmath.h>
+#include <t3d/t3dmodel.h>
 
 #include <math.h>
 #include <stdbool.h>
@@ -13,47 +15,20 @@
 #include "pfm_hdri.h"
 
 #define FB_COUNT 3
-#define PIPELINE_BUFFERS 2
+#define PIPELINE_BUFFERS 1
 #define BUFFER_W 320
 #define BUFFER_H 240
 #define EXPOSURE_MIN 0.0f
-#define EXPOSURE_MAX 200.0f
-#define EXPOSURE_STEP 0.5f
+#define EXPOSURE_MAX 9999.0f
+#define EXPOSURE_STEP 0.01f
 
 //#define HDRI_PATH "rom:/textures/courtyard"
 //#define HDRI_PATH "rom:/textures/ferndale_studio"
 //#define HDRI_PATH "rom:/textures/sunset"
-#define GBUFFER_ALBEDO_PATH "rom:/models/spheres_albedo.rgba16.sprite"
-#define GBUFFER_PACKED_PATH "rom:/models/spheres_packed.rgba16.sprite"
 #define HDRI_PATH "rom:/textures/courtyard"
-//#define GBUFFER_ALBEDO_PATH "rom:/models/buffer_albedo240.rgba16.sprite"
-//#define GBUFFER_PACKED_PATH "rom:/models/buffer_packed240.rgba16.sprite"
-#define MEASURE_RSP_PERF 1
-
-const uint16_t *sprite_pixels_u16(const sprite_t *spr)
-{
-    return (const uint16_t *)spr->data;
-}
-
-bool sprite_dim_match(const sprite_t *spr, int w, int h)
-{
-    return spr && spr->width == w && spr->height == h;
-}
-
-static bool load_gbuffers_from_sprites(const char *albedo_path, const char *packed_path, sprite_t **albedo, sprite_t **packed)
-{
-    sprite_t* _albedo = sprite_load(albedo_path);
-    sprite_t* _packed = sprite_load(packed_path);
-
-    if (!_albedo || !_packed) {
-        debugf("sprite load failed: %s / %s\n", albedo_path, packed_path);
-        return false;
-    }
-    *albedo = _albedo;
-    *packed = _packed;
-
-    return true;
-}
+#define MODEL_ALBEDO_PATH "rom:/models/scene.t3dm"
+#define MODEL_PACKED_PATH "rom:/models/scene_p.t3dm"
+#define MEASURE_RSP_PERF 0
 
 static void setup_default_lighting(LightingState *ls)
 {
@@ -63,19 +38,13 @@ static void setup_default_lighting(LightingState *ls)
     ls->dir[0][0] = 0.707f;
     ls->dir[0][1] = 0.577f;
     ls->dir[0][2] = 0.408f;
-    ls->color[0][0] = 10.0f;
-    ls->color[0][1] = 6.0f;
-    ls->color[0][2] = 4.0f;
+    ls->color[0][0] = sqrt(10.0f);
+    ls->color[0][1] = sqrt(6.0f);
+    ls->color[0][2] = sqrt(4.0f);
 
-    ls->dir[1][0] = -0.4f;
-    ls->dir[1][1] = 0.9f;
-    ls->dir[1][2] = 0.2f;
-    ls->color[1][0] = 1.5f;
-    ls->color[1][1] = 1.0f;
-    ls->color[1][2] = 1.0f;
-
-    ls->exposure = 50.0f;
-    ls->hdri_brightness = 0.1f / 50.0f;
+    ls->exposure = 1.0f;
+    ls->hdri_strength = 1.0f;
+    ls->emission_strength = 1.0f;
 }
 
 static inline float clampf_local(float v, float lo, float hi)
@@ -83,36 +52,6 @@ static inline float clampf_local(float v, float lo, float hi)
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
-}
-
-// Packed RGBA16 layout is RRRRRGGGGGBBBBBA:
-// R(5)=roughness, G(5)=X, B(5)=Y, A(1)=metalness.
-// Clamp XY so ||(x,y)|| <= 1 before decoding.
-static void preprocess_packed_rgba16_normals(const uint16_t *src, uint16_t *dst, int w, int h)
-{
-    const size_t n = (size_t)w * (size_t)h;
-    for (size_t i = 0; i < n; i++) {
-        const uint16_t p = src[i];
-
-        const uint16_t rough5 = (p >> 11) & 0x1Fu;
-        const uint16_t x5 = (p >> 6) & 0x1Fu;
-        const uint16_t y5 = (p >> 1) & 0x1Fu;
-        const uint16_t m1 = p & 0x01u;
-
-        float x = ((float)x5 * (2.0f / 31.0f)) - 1.0f;
-        float y = ((float)y5 * (2.0f / 31.0f)) - 1.0f;
-        float len2 = x * x + y * y;
-        if (len2 > 1.0f) {
-            float inv_len = 1.0f / sqrtf(len2);
-            x *= inv_len;
-            y *= inv_len;
-        }
-
-        uint16_t x5_out = (uint16_t)(clampf_local((x + 1.0f) * 0.5f, 0.0f, 1.0f) * 31.0f + 0.5f);
-        uint16_t y5_out = (uint16_t)(clampf_local((y + 1.0f) * 0.5f, 0.0f, 1.0f) * 31.0f + 0.5f);
-
-        dst[i] = (uint16_t)((rough5 << 11) | (x5_out << 6) | (y5_out << 1) | m1);
-    }
 }
 
 int main(void)
@@ -124,153 +63,223 @@ int main(void)
     dfs_init(DFS_DEFAULT_LOCATION);
     joypad_init();
 
-    display_init(RESOLUTION_320x240, DEPTH_16_BPP, FB_COUNT, GAMMA_CORRECT_DITHER, FILTERS_RESAMPLE_ANTIALIAS_DEDITHER);
+    display_init(RESOLUTION_320x240, DEPTH_16_BPP, FB_COUNT, GAMMA_NONE, FILTERS_RESAMPLE_ANTIALIAS_DEDITHER);
     rdpq_init();
     t3d_init((T3DInitParams){});
     rsp_pbr_blend_init();
 
-    sprite_t *albedo_spr = NULL;
-    sprite_t *packed_spr = NULL;
-    if (!load_gbuffers_from_sprites(GBUFFER_ALBEDO_PATH, GBUFFER_PACKED_PATH, &albedo_spr, &packed_spr)) {
-        debugf("GBuffer load failed\n");
-        for (;;) {}
-    }
+    int w = BUFFER_W;
+    int h = BUFFER_H;
 
-    int w = albedo_spr->width;
-    int h = albedo_spr->height;
-
-    if (!sprite_dim_match(packed_spr, w, h)) {
-        debugf("GBuffer size mismatch\n");
-        for (;;) {}
-    }
-    if (w != BUFFER_W || h != BUFFER_H) {
-        debugf("Expected %dx%d buffers, got %dx%d\n", BUFFER_W, BUFFER_H, w, h);
-        for (;;) {}
-    }
+    rspq_block_t* albedoblock = NULL;
+    rspq_block_t* packedblock = NULL;
 
     HDRISet hdri = {0};
     if (!load_pfm_hdri(HDRI_PATH, &hdri)) {
-        debugf("HDRI load failed\n");
-        for (;;) {}
+        assertf(0,"HDRI load failed\n");
     }
 
-    MatcapSet mats_db[PIPELINE_BUFFERS] = {0};
-    for (int i = 0; i < PIPELINE_BUFFERS; i++) {
-        if (!alloc_matcaps(&mats_db[i])) {
-            debugf("matcap alloc failed\n");
-            for (;;) {}
+    T3DModel *model_albedo = t3d_model_load(MODEL_ALBEDO_PATH);
+    T3DModel *model_packed = t3d_model_load(MODEL_PACKED_PATH);
+    if (!model_albedo || !model_packed) {
+        assertf(0,"Model load failed\n");
+    }
+
+    surface_t gbuffer_albedo;
+    surface_t gbuffer_packed;
+    surface_t gbuffer_depth = surface_alloc(FMT_RGBA16, w, h);
+    if (!gbuffer_depth.buffer) {
+        assertf(0,"GBuffer/depth alloc failed\n");
+    }
+    {
+        gbuffer_albedo = surface_alloc(FMT_RGBA16, w, h);
+        gbuffer_packed = surface_alloc(FMT_RGBA16, w, h);
+        if (!gbuffer_albedo.buffer || !gbuffer_packed.buffer) {
+            assertf(0,"GBuffer alloc failed\n");
         }
     }
 
-    surface_t decoded_lighting_surf[PIPELINE_BUFFERS];
-    uint32_t *decoded_lighting[PIPELINE_BUFFERS];
-
-    for (int i = 0; i < PIPELINE_BUFFERS; i++) {
-        decoded_lighting_surf[i] = surface_alloc(FMT_RGBA32, w, h * 3);
-
-        decoded_lighting[i] = (decoded_lighting_surf[i].buffer);
-
-        if (!decoded_lighting[i]) {
-            debugf("decode buffers alloc failed\n");
-            for (;;) {}
+    MatcapSet mats_db = {0};
+    {
+        if (!alloc_matcaps(&mats_db)) {
+            assertf(0,"matcap alloc failed\n");
         }
     }
 
-    const uint16_t *albedo = sprite_pixels_u16(albedo_spr);
-    const uint16_t *packed_src = sprite_pixels_u16(packed_spr);
-    uint16_t *packed_preprocessed = malloc((size_t)w * (size_t)h * sizeof(uint16_t));
-    const uint16_t *packed = packed_preprocessed;
-    if (!albedo || !packed_src || !packed_preprocessed) {
-        debugf("sprite pixel access failed\n");
-        for (;;) {}
-    }
-    preprocess_packed_rgba16_normals(packed_src, packed_preprocessed, w, h);
+    surface_t decoded_lighting_surf;
+    uint32_t *decoded_lighting;
 
-    surface_t albedo_surf = surface_make_linear((void *)albedo, FMT_RGBA16, (uint16_t)w, (uint16_t)h);
-    surface_t packed_surf = surface_make_linear((void *)packed, FMT_RGBA16, (uint16_t)w, (uint16_t)h);
+
+    decoded_lighting_surf = surface_alloc(FMT_RGBA32, w, h * 3);
+    decoded_lighting = (decoded_lighting_surf.buffer);
+
+    if (!decoded_lighting) {
+        assertf(0,"decode buffers alloc failed\n");
+    }
+
 
     LightingState lights;
     setup_default_lighting(&lights);
 
-    CameraState cam = {{0.0f, 0.0f, 1.0f}};
-    float yaw = 0.0f;
-    int frame = 0;
+    CameraState cam_history = {{0.0f, 0.0f, 1.0f}};
 
-    surface_t *pending_disp = NULL;
-    rspq_syncpoint_t pending_sync = 0;
-    bool pending_show = false;
+    T3DViewport viewport = t3d_viewport_create_buffered(FB_COUNT);
+
+    T3DMat4 model_mat;
+    t3d_mat4_identity(&model_mat);
+    T3DMat4FP *model_mat_fp = malloc_uncached(sizeof(T3DMat4FP));
+    t3d_mat4_to_fixed(model_mat_fp, &model_mat);
+
+    T3DVec3 cam_pos = {{0.0f, 4.0f, 20.0f}};
+    float cam_yaw = 0.0f;
+    float cam_pitch = 0.0f;
+    int frame = 0;
+    uint64_t last_ticks = get_ticks_us();
 
     for (;;) {
         uint64_t t_frame0 = get_ticks_us();
-        int slot = frame & (PIPELINE_BUFFERS - 1);
         joypad_poll();
+        joypad_inputs_t joypad = joypad_get_inputs(JOYPAD_PORT_1);
 
-        joypad_buttons_t held = joypad_get_buttons_held(JOYPAD_PORT_1);
-        if (held.c_up) {
-            lights.exposure = clampf_local(lights.exposure + EXPOSURE_STEP, EXPOSURE_MIN, EXPOSURE_MAX);
-        } else if (held.c_down) {
-            lights.exposure = clampf_local(lights.exposure - EXPOSURE_STEP, EXPOSURE_MIN, EXPOSURE_MAX);
+        if (joypad.stick_x < 10 && joypad.stick_x > -10) joypad.stick_x = 0;
+        if (joypad.stick_y < 10 && joypad.stick_y > -10) joypad.stick_y = 0;
+
+        uint64_t now_ticks = get_ticks_us();
+        float dt = (float)(now_ticks - last_ticks) / 1000000.0f;
+        last_ticks = now_ticks;
+
+        float look_speed = .6f * dt;
+        cam_yaw += (float)joypad.stick_x * look_speed * 0.01f;
+        cam_pitch += (float)joypad.stick_y * look_speed * 0.01f;
+        cam_pitch = clampf_local(cam_pitch, -1.4f, 1.4f);
+
+        T3DVec3 cam_dir = {{
+            fm_cosf(cam_yaw) * fm_cosf(cam_pitch),
+            fm_sinf(cam_pitch),
+            fm_sinf(cam_yaw) * fm_cosf(cam_pitch)
+        }};
+        t3d_vec3_norm(&cam_dir);
+
+        float move_speed = 90.0f * dt;
+        T3DVec3 cam_fwd_xz = {{cam_dir.v[0], 0.0f, cam_dir.v[2]}};
+        t3d_vec3_norm(&cam_fwd_xz);
+        T3DVec3 cam_right = {{cam_fwd_xz.v[2], 0.0f, -cam_fwd_xz.v[0]}};
+
+        {
+            if (joypad.btn.d_up) {
+                cam_pos.v[0] += cam_dir.v[0] * move_speed;
+                cam_pos.v[1] += cam_dir.v[1] * move_speed;
+                cam_pos.v[2] += cam_dir.v[2] * move_speed;
+            }
+            if (joypad.btn.d_down) {
+                cam_pos.v[0] -= cam_dir.v[0] * move_speed;
+                cam_pos.v[1] -= cam_dir.v[1] * move_speed;
+                cam_pos.v[2] -= cam_dir.v[2] * move_speed;
+            }
+        }
+        if (joypad.btn.d_right) {
+            cam_pos.v[0] -= cam_right.v[0] * move_speed;
+            cam_pos.v[2] -= cam_right.v[2] * move_speed;
+        }
+        if (joypad.btn.d_left) {
+            cam_pos.v[0] += cam_right.v[0] * move_speed;
+            cam_pos.v[2] += cam_right.v[2] * move_speed;
         }
 
-        yaw += 0.06f;
-        build_camera_from_yaw(yaw, &cam);
+        T3DVec3 cam_target = {{
+            cam_pos.v[0] + cam_dir.v[0],
+            cam_pos.v[1] + cam_dir.v[1],
+            cam_pos.v[2] + cam_dir.v[2]
+        }};
+        cam_history.forward[0] = cam_dir.x;
+        cam_history.forward[1] = cam_dir.y;
+        cam_history.forward[2] = cam_dir.z;
+
+        surface_t* displaysurf = display_get();
+
+        t3d_viewport_set_projection(&viewport, T3D_DEG_TO_RAD(85.0f), 20.0f, 500.0f);
+        t3d_viewport_look_at(&viewport, &cam_pos, &cam_target, &(T3DVec3){{0,1,0}});
+
+        // draw gbuffers
+        rdpq_attach_clear(&gbuffer_albedo, &gbuffer_depth);
+        t3d_frame_start();
+        t3d_viewport_attach(&viewport);
+        t3d_light_set_ambient((uint8_t[4]){0xFF, 0xFF, 0xFF, 0xFF});
+        t3d_light_set_count(0);
+        t3d_matrix_push(model_mat_fp);
+        if(!albedoblock){
+            rspq_block_begin();
+            T3DModelIter it = t3d_model_iter_create(model_albedo, T3D_CHUNK_TYPE_OBJECT);
+            while(t3d_model_iter_next(&it)) {
+                // (Apply materials here before the draw)
+                t3d_model_draw_material(it.object->material, NULL);
+                t3d_state_set_vertex_fx(T3D_VERTEX_FX_NONE, 0,0);
+                rdpq_set_prim_color(RGBA32(0,127,127,32));
+                t3d_state_set_vertex_fx_scale(0b00000000'00000100);
+                t3d_model_draw_object(it.object, NULL);
+            }
+            albedoblock = rspq_block_end();
+        } rspq_block_run(albedoblock);
+
+        t3d_matrix_pop(1);
+        rdpq_detach();
+
+        rdpq_attach(&gbuffer_packed, &gbuffer_depth);
+        rdpq_clear(RGBA32(0, 0, 0, 0xFF));
+        t3d_light_set_ambient((uint8_t[4]){0xFF, 0xFF, 0xFF, 0xFF});
+        t3d_light_set_count(0);
+        t3d_matrix_push(model_mat_fp);
+        if(!packedblock){
+            rspq_block_begin();
+            T3DModelIter it = t3d_model_iter_create(model_packed, T3D_CHUNK_TYPE_OBJECT);
+            while(t3d_model_iter_next(&it)) {
+                t3d_model_draw_material(it.object->material, NULL);
+                rdpq_mode_zmode(ZMODE_DECAL);
+                rdpq_mode_zbuf(true, false);
+                t3d_state_set_vertex_fx(T3D_VERTEX_FX_SPHERICAL_VERTEXCOLOR, 0,0);
+                t3d_state_set_vertex_fx_scale(0b00000000'00010000);
+                t3d_model_draw_object(it.object, NULL);
+            }
+            packedblock = rspq_block_end();
+        } rspq_block_run(packedblock);
+        t3d_matrix_pop(1);
+        rdpq_detach();
 
         uint64_t t_mat0 = get_ticks_us();
-        generate_matcaps(&cam, &lights, &hdri, &mats_db[slot]);
+        uint64_t t_dec0 = t_mat0;
+
+        // generate matcaps for this frame
+        generate_matcaps(&cam_history, &lights, &hdri, &mats_db);
         uint64_t t_mat1 = get_ticks_us();
 
-        uint64_t t_dec0 = get_ticks_us();
-        decode_packed_cpu_lighting_interleaved8(packed,
-                          (uint8_t*)decoded_lighting[slot],
-                          w,
-                          h,
-                          &mats_db[slot]);
+        // wait for the gbuffers to be drawn (not parallelized at this stage)
+        rspq_wait();
+        t_dec0 = t_mat1;
+        // matcaps -> lighting buffers
+        cpu_decode_packed_to_interleaved_lighting(
+            (const uint16_t *)gbuffer_packed.buffer,
+            (uint32_t*)decoded_lighting,
+            w,
+            h,
+            &mats_db);
+        
         uint64_t t_dec1 = get_ticks_us();
 
-        if (pending_show) {
-            //rspq_syncpoint_wait(pending_sync);
-            rdpq_attach(pending_disp, NULL);
-            rdpq_detach_show();
-            pending_show = false;
-            pending_disp = NULL;
-        }
-
-        surface_t *disp = display_get();
-        if (!disp) {
-            continue;
-        }
-        if (disp->width != w || disp->height != h) {
-            debugf("Display/sprite dimension mismatch: display=%dx%d sprite=%dx%d\n",
-                   disp->width, disp->height, w, h);
-            for (;;) {}
-        }
-        
         uint64_t t_rsp0 = get_ticks_us();
-        if (MEASURE_RSP_PERF) {
-            rspq_wait();
-            rspq_highpri_begin();
-        }
 
-        rsp_pbr_blend_set_gbuffer(&albedo_surf, &packed_surf, disp);
-        rsp_pbr_blend_set_lighting_buffer(&decoded_lighting_surf[slot]);
+        rsp_pbr_blend_set_gbuffer(&gbuffer_albedo, &gbuffer_packed, displaysurf);
+        rsp_pbr_blend_set_lighting_buffers(&decoded_lighting_surf);
         rsp_pbr_blend_set_dither_matrix();
         rsp_pbr_blend_postprocess();
-        //pending_sync = rspq_syncpoint_new();
-        pending_disp = disp;
-        pending_show = true;
+        rdpq_attach(displaysurf, NULL);
 
-        if (MEASURE_RSP_PERF) {
-            rspq_highpri_end();
-            rspq_flush();
-            rspq_highpri_sync();
-        }
-
+        rdpq_detach_show();
         uint64_t t_rsp1 = get_ticks_us();
 
         uint64_t t_frame1 = get_ticks_us();
-        uint64_t mat_us = t_mat1 - t_mat0;
-        uint64_t dec_us = t_dec1 - t_dec0;
-        uint64_t rsp_submit_us = t_rsp1 - t_rsp0;
+        uint64_t mat_us = (t_dec0 - t_mat0);
+        uint64_t dec_us = (t_dec1 - t_dec0);
+        uint64_t rsp_submit_us = (t_rsp1 - t_rsp0);
         uint64_t frame_us = t_frame1 - t_frame0;
         frame++;
         if ((frame % 30) == 0) {
@@ -283,13 +292,14 @@ int main(void)
         }
     }
 
-    sprite_free(albedo_spr);
-    sprite_free(packed_spr);
-
-    for (int i = 0; i < PIPELINE_BUFFERS; i++) {
-        surface_free(&decoded_lighting_surf[i]);
-        free_matcaps(&mats_db[i]);
+    {
+        surface_free(&decoded_lighting_surf);
+        free_matcaps(&mats_db);
+        surface_free(&gbuffer_albedo);
+        surface_free(&gbuffer_packed);
     }
+    surface_free(&gbuffer_depth);
+    free_uncached(model_mat_fp);
 
     t3d_destroy();
     return 0;

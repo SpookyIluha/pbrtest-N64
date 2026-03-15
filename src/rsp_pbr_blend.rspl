@@ -16,6 +16,10 @@ include "rsp_queue.inc"
 #define BUFFER_SIZE_GBUFFER_MINUSONE 191
 #define BUFFER_SIZE_LIGHTING_THREE_MINUSONE 1151
 
+#define GBUFFER_8PIXEL_OFFSET 16
+#define LIGHTING_8PIXEL_OFFSET 32
+#define LIGHTING_16PIXEL_OFFSET 64
+
 //#define BUFFER_PIXELS 32
 //#define BUFFER_LIGHTING_PIXELS 96
 
@@ -33,7 +37,7 @@ state {
     u32 SRC_PIXELS_ITERATIONS;  // Total iterations for the buffers
 
     // lighting buffer pointers
-    // lighting buffer consists of 8 consecutive pixels of diffuse, rough25, rough75, etc.
+    // lighting buffer consists of 8 consecutive pixels of diffuse, spec25, spec75, etc.
     // the buffers are interleaved, so they can be async DMAIn'd at once
     u32 LIGHTING_SRC_RDRAM;  // Pointer to the interleaved lighting buffer in RDRAM
     
@@ -41,7 +45,7 @@ state {
     alignas(16)
     u16 ALBEDO_BUF1[BUFFER_PIXELS]; /* albedo: RRRRRGGGGGBBBBBA */
     alignas(16)
-    u16 PACKED_BUF1[BUFFER_PIXELS]; /* packed: RRRRRYYYY0XXXX0M */
+    u16 PACKED_BUF1[BUFFER_PIXELS]; /* packed: MggggYYYYYXXXX00 */
     alignas(16)
     u16 DEST_BUF1[BUFFER_PIXELS]; /* destination: RRRRRGGGGGBBBBB0 */
     
@@ -138,10 +142,13 @@ command<3> PBRBlendCmd_PostProcess()
 
   vec16 VCONSTS;
   VCONSTS.x = 0b01111100'00000000; // mask to only keep 5 bits from a fraction, used for RGBA16 conversion
-  VCONSTS.y = 0b00000000'00000001; // mask to only keep 1 bits from a metalness, used for RGBA16 conversion
-  VCONSTS.z = 0b01111111'11111111; // 0.99999
+  VCONSTS.y = 0b00000000'00000001; // RGBA16 alpha bit
+  VCONSTS.z = 0b01111111'00000000; // 0.99999
+  VCONSTS.w = 0b00111100'00000000; // mask to only keep 4 bits from a fraction, used for RGBA16 glossiness conversion
+  VCONSTS.X = 1;
+  VCONSTS.Y = 0b10000000'00000000; // mask to only keep 1 bits from a metalness, used for RGBA16 conversion
   const vec16 VONE = VCONSTS.z; // 1.0 in u1.15 sfract
-  const vec16 VEIGHT = 0b00001000'00000000; // integer 8
+  const vec16 V_HDR_MULTIPLIER = 2; // integer
   postprocess_loop:
   {
     u32 bufferscounter = load(SRC_PIXELS_ITERATIONS);
@@ -176,262 +183,283 @@ command<3> PBRBlendCmd_PostProcess()
     lightingDMEM = LIGHTING_BUF1;
     destDMEM = DEST_BUF1;
     
+    // dither factor
     vec16 dither = load(DITHER_MATRIX_8X2_1);
 
     u32 albedoPixels = ALBEDO_BUF1;
     u32 packedPixels = PACKED_BUF1;
     u32 diffusePixels = LIGHTING_BUF1; // lighting buffers are interleaved 8 pixels at a time
-    u32 rough25Pixels = LIGHTING_BUF1; rough25Pixels += 8*RGBA32_BYTES;
-    u32 rough75Pixels = LIGHTING_BUF1; rough75Pixels += 8*RGBA32_BYTES + 8*RGBA32_BYTES;
+    u32 spec25Pixels = LIGHTING_BUF1; spec25Pixels += LIGHTING_8PIXEL_OFFSET;
+    u32 spec75Pixels = LIGHTING_BUF1; spec75Pixels += LIGHTING_16PIXEL_OFFSET;
     u32 destPixels = DEST_BUF1;
-    u32 fresnelPixels = LIGHTING_BUF1; fresnelPixels += 3; // fresnel factor is stored as an alpha channel in any lighting buffer, 
+    u32 fresnelPixels = LIGHTING_BUF1; fresnelPixels += 3; // fresnel factor is stored as an alpha channel in diffuse lighting buffer, 
     // so add 3 bytes to the DMEM buffer pointer
   
     u16 pixelcounter = BUFFER_PIXELS;
-    // TODO: not finished
     // combine 8 pixels of albedo+packed+lighting at a time
-    while(pixelcounter > 0){
-      vec16 albedo = load(albedoPixels); /* albedo: RRRRR.GGGGG.BBBBB.A */
-      vec16 packed = load(packedPixels); /* packed: rrrrr.YYYYY.XXXX0.M */
-      albedoPixels += RGBA16_BYTES*8;
-      packedPixels += RGBA16_BYTES*8;
+    {
+      // define all the vectors used beforehand
+      // diffuse lighting
+      vec16 diffuse_r;
+      vec16 diffuse_g;
+      vec16 diffuse_b;
+      // specular glossiness 0.25 lighting
+      vec16 spec25_r;
+      vec16 spec25_g;
+      vec16 spec25_b;
+      // specular glossiness 0.75 lighting
+      vec16 spec75_r;
+      vec16 spec75_g;
+      vec16 spec75_b;
+      // albedo RGB factor
+      vec16 albedo_r;
+      vec16 albedo_g;
+      vec16 albedo_b;
+      // glossiness factor
+      vec16 glossiness;
+      // fresnel factor (f0 - 1.0 range)
+      vec16 fresnel;
 
-      // Isolate R,G,B components of albedo. Since we want to handle saturation during multiplication,
-      // we need to scale each component into a 16-bit unsigned fraction, which means
-      // that the 5-bit components must go into bits 14..10. Thus:
-      // 
-      // R is at 15..11, so it must be shift right by 1
-      // G is at 10..6, so it must be shift left by 4
-      // B is at 5..1, so it must be shift left by 9
-      vec16 albedo_r = albedo >> 1;
-      vec16 albedo_g = albedo << 4;
-      vec16 albedo_b = albedo << 9;
-
-      // Keep only correct bits
-      albedo_r &= VCONSTS.x;
-      albedo_g &= VCONSTS.x;
-      albedo_b &= VCONSTS.x;
-
-      // Now isolate the roughness and metalness components
-      // roughness is at 15..11, so it must be shift right by 1
-      vec16 roughness = packed >> 1;
-      roughness &= VCONSTS.x;
-
-      // Metalness is a 1-bit lsb 00000.00000.00000.M, shift left by 15 to get u1.15 sfract
-      vec16 metalness:sint = packed & VCONSTS.y;
-      metalness:sfract = metalness:sint * VONE:sfract; // to 0.99999
-
-      // VONE is 01111111.11111111 s1.15
-      vec16 oneminusroughness:sfract = VONE:sfract - roughness:sfract;
-      vec16 oneminusmetalness:sfract = VONE:sfract - metalness:sfract;
-      
-      undef packed;
+      // Load the lighting buffers:
       // for each color channel, we need to load the 3 lighting pixels
       // also we need a fresnel factor from the lighting buffer
-      // 8 pixels of a single channel from RGBA32 need to be loaded into 3 vectors, and the A channeel into another vector
+      // 8 pixels of a single channel from RGBA32 need to be loaded into 3 vectors, and the A channel into another vector
       // "lfv" will load every 4th byte, starting from a pointer
       // The vectors look like this:
       // [D0 D1 ... D6 D7] 
       // [R25_0 R25_1 ... R25_6 R25_7] 
       // [R75_0 R75_1 ... R75_6 R75_7]
       // [F0 F1 ... F6 F7]
+
       // We need to load the fresnel vector only once, not per channel, so do that first
-    
       // lfv will load strided bytes into bits 14..7, so fresnel can be treated as u1.15 sfract directly
-      vec16 fresnel;
-      @Barrier("fresnel") 
+      //@Barrier("fresnel") 
       asm_op("lfv", fresnel, 0,  0, fresnelPixels);
-      @Barrier("fresnel") 
+      //@Barrier("fresnel") 
       asm_op("lfv", fresnel, 8, 16, fresnelPixels);
       fresnelPixels += 96; // to next 8 pixels
+      
+      // lfv will load strided bytes into bits 14..7 so they can be treated as u1.15 as well
+      // R-Channel
+      asm_op("lfv", diffuse_r, 0,  0, diffusePixels);
+      asm_op("lfv", diffuse_r, 8, 16, diffusePixels);
+      diffusePixels += 1;
 
-      {
-        // load the lighting buffers
-        vec16 diffuse_r;
-        vec16 diffuse_g;
-        vec16 diffuse_b;
+      asm_op("lfv", spec25_r, 0,  0, spec25Pixels);
+      asm_op("lfv", spec25_r, 8, 16, spec25Pixels);
+      spec25Pixels += 1;
 
-        vec16 rough25_r;
-        vec16 rough25_g;
-        vec16 rough25_b;
+      asm_op("lfv", spec75_r, 0,  0, spec75Pixels);
+      asm_op("lfv", spec75_r, 8, 16, spec75Pixels);
+      spec75Pixels += 1;
 
-        vec16 rough75_r;
-        vec16 rough75_g;
-        vec16 rough75_b;
+      // G-Channel
+
+      asm_op("lfv", diffuse_g, 0,  0, diffusePixels);
+      asm_op("lfv", diffuse_g, 8, 16, diffusePixels);
+      diffusePixels += 1;
+
+      asm_op("lfv", spec25_g, 0,  0, spec25Pixels);
+      asm_op("lfv", spec25_g, 8, 16, spec25Pixels);
+      spec25Pixels += 1;
+
+      asm_op("lfv", spec75_g, 0,  0, spec75Pixels);
+      asm_op("lfv", spec75_g, 8, 16, spec75Pixels);
+      spec75Pixels += 1;
+
+      asm_op("lfv", diffuse_b, 0,  0, diffusePixels);
+      asm_op("lfv", diffuse_b, 8, 16, diffusePixels);
+      diffusePixels += 94; // to next 8 pixels in an interleaved buffer
+
+      asm_op("lfv", spec25_b, 0,  0, spec25Pixels);
+      asm_op("lfv", spec25_b, 8, 16, spec25Pixels);
+      spec25Pixels += 94; // to next 8 pixels
+
+      asm_op("lfv", spec75_b, 0,  0, spec75Pixels);
+      asm_op("lfv", spec75_b, 8, 16, spec75Pixels);
+      spec75Pixels += 94; // to next 8 pixels
+
+      while(pixelcounter > 0){
+        // load the g-buffers
+        vec16 albedo = load(albedoPixels); /* albedo: RRRRR.GGGGG.BBBBB.A */
+        vec16 packed = load(packedPixels); /* packed: Mgggg.XXXXX.YYYY0.0 */
         
-        // lfv will load strided bytes into bits 14..7 so they can be treated as u1.15 as well
-        // R-Channel
-        @Barrier("rgba32_r") 
-        asm_op("lfv", diffuse_r, 0,  0, diffusePixels);
-        @Barrier("rgba32_r") 
-        asm_op("lfv", diffuse_r, 8, 16, diffusePixels);
-        diffusePixels += 1;
+        // to next 8 pixels of the g-buffer
+        albedoPixels += GBUFFER_8PIXEL_OFFSET;
+        packedPixels += GBUFFER_8PIXEL_OFFSET;
   
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough25_r, 0,  0, rough25Pixels);
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough25_r, 8, 16, rough25Pixels);
-        rough25Pixels += 1;
-  
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough75_r, 0,  0, rough75Pixels);
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough75_r, 8, 16, rough75Pixels);
-        rough75Pixels += 1;
-
-        // G-Channel
-
-        @Barrier("rgba32_g") 
-        asm_op("lfv", diffuse_g, 0,  0, diffusePixels);
-        @Barrier("rgba32_g") 
-        asm_op("lfv", diffuse_g, 8, 16, diffusePixels);
-        diffusePixels += 1;
-  
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough25_g, 0,  0, rough25Pixels);
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough25_g, 8, 16, rough25Pixels);
-        rough25Pixels += 1;
-  
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough75_g, 0,  0, rough75Pixels);
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough75_g, 8, 16, rough75Pixels);
-        rough75Pixels += 1;
-
         // B-Channel
 
-        @Barrier("rgba32_b") 
-        asm_op("lfv", diffuse_b, 0,  0, diffusePixels);
-        @Barrier("rgba32_b") 
-        asm_op("lfv", diffuse_b, 8, 16, diffusePixels);
-        diffusePixels += 94; // to next 8 pixels in an interleaved buffer
-  
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough25_b, 0,  0, rough25Pixels);
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough25_b, 8, 16, rough25Pixels);
-        rough25Pixels += 94; // to next 8 pixels
-  
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough75_b, 0,  0, rough75Pixels);
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough75_b, 8, 16, rough75Pixels);
-        rough75Pixels += 94; // to next 8 pixels
+        // Isolate the glossiness component
+        // glossiness is at 15..11, so we can just cut the msb and everything else
+        glossiness = packed & VCONSTS.w;
 
-        // Now we need to add all the lighting together:
+        // Isolate R,G,B components of albedo. Since we want to handle correct multiplication,
+        // we need to scale each component into a 16-bit signed fraction, which means
+        // that the 5-bit components must go into bits 14..10. Thus:
+        // 
+        // R is at 15..11, so it must be shift right by 1
+        // G is at 10..6, so it must be shift left by 4
+        // B is at 5..1, so it must be shift left by 9
+
+        albedo_r = albedo >> 1;
+        albedo_g = albedo << 4;
+        albedo_b = albedo << 9;
+
+        undef albedo;
+        // Since metalness is 1-bit, we can select the correct multiplier for albedo by using the compare opcode
+        // If metalness == 0, then we'll select the diffuse, otherwise we'll select specular, which will be multiplied by albedo
+        // Metalness is a 1-bit msb M0000.00000.00000.0, we can just AND with 0x8000
+        vec16 metalness = packed & VCONSTS.Y;
+        undef packed;
+        vec16 metalnessselect = metalness == 0;
+
+        undef metalnessselect;
+        undef metalness;
+        
+        // VONE is 0.9999 in s1.15
+        vec16 oneminusglossiness:sfract = VONE:sfract - glossiness:sfract;
+
+        // Then we need to add all the lighting together:
         //
-        // albedo/metal/roughness assumed sfract vectors,
-        // specular/diffuse assumed sfract vectors
+        // everything here is an sfract vector except V_HDR_MULTIPLIER which is an integer vector
         //
         // The general approximated formula for combining the lighting is:
         //
-        // specular = rough75 * roughness + (rough25 * (1 - roughness)); // linear interpolation between shiny and matte specular
+        // specular = lerp(spec75, spec25, glossiness); // linear interpolation between matte and shiny specular
         // metal = albedo * specular * metalness // metallic portion
         // dielectric = albedo * diffuse * (1 - metalness) // dielectric diffuse portion
         // result = specular * fresnel + metal + dielectric // add all the components + fresnel specular
         //
         // Technically fresnel coefficients should be different for 
-        // roughness = 0.25 and roughness 0.75, but is assumed 0.25 to reduce instructions
+        // glossiness = 0.25 and glossiness = 0.75, but is assumed 0.25 to reduce instructions
         // 
-        // the result should be sfract multiplied by 8 
-        // so that the 3.5 HDR lighting is preserved and the value is saturated
+        // the result should be tonemapped down to SDR using a formula of SDR = [1 - (1 - 0.25*x)^4] where x is the HDR color
+        // so that the u3.5 HDR lighting is preserved and the value is saturated
+        //
+        // Then we need to pack the result back into 16-bit pixels. We reverse the shifts
+        // result pixels: 0RRRRRRRRRRRRRRR, 0GGGGGGGGGGGGGGG, 0BBBBBBBBBBBBBBB
+        // 16bpp should be: RRRRR.GGGGG.BBBBB.1
+        //
+        // In parallel, we need to load the lighting buffers for the next loop:
+        // for each color channel, we need to load the 3 lighting pixels
+        // also we need a fresnel factor from the lighting buffer
+        // 8 pixels of a single channel from RGBA32 need to be loaded into 3 vectors, and the A channel into another vector
+        // "lfv" will load every 4th byte, starting from a pointer
+        // The vectors look like this:
+        // [D0 D1 ... D6 D7] 
+        // [R25_0 R25_1 ... R25_6 R25_7] 
+        // [R75_0 R75_1 ... R75_6 R75_7]
+        // [F0 F1 ... F6 F7]
+        // We need to load the fresnel vector only once, not per channel, so do that first
+        // lfv will load strided bytes into bits 14..7, so fresnel can be treated as u1.15 sfract directly
 
-        // R-Channel
+        // The code below is very interleaved to minimize VU stalls, also in parallel it will load the next 8 pixels
+
+        // specular lighting = lerp(spec75, spec25, glossiness)
+        vec16 specular_r;
+        vec16 specular_g;
+        vec16 specular_b;
+        // albedo * (metalness? specular : diffuse) 
+        vec16 albedomultiplier_r;  
+        vec16 albedomultiplier_g;
+        vec16 albedomultiplier_b;
+        // combined result
         vec16 result_r;
-        {
-          vec16 dielectric_r:sfract = albedo_r:sfract * oneminusmetalness:sfract;
-          vec16 metal_r:sfract = albedo_r:sfract * metalness:sfract;
-        
-          vec16 specular_r:sfract = rough75_r:sfract * roughness:sfract;
-          specular_r:sfract = rough25_r:sfract +* oneminusroughness:sfract;
-
-          result_r:sfract = metal_r:sfract * specular_r:sfract;
-          result_r:sfract = dielectric_r:sfract +* diffuse_r:sfract;
-          result_r:sfract = specular_r:sfract +* fresnel:sfract;
-          result_r:sfract = VEIGHT:sfract +* result_r:sfract;
-          
-          //result_r:sfract = oneminusmetalness:sfract;
-          //result_r:sfract = specular_r:sfract +* fresnel:sfract;
-        }
-        result_r:sfract = VONE:sfract - result_r:sfract;
-        result_r:sfract = result_r:sfract * result_r:sfract;
-        result_r:sfract = result_r:sfract * result_r:sfract;
-        result_r:sfract = result_r:sfract * result_r:sfract;
-        result_r:sfract = VONE:sfract - result_r:sfract;
-        
-        result_r:sfract = result_r:sfract + dither:sfract;
-
-        // G-Channel
-        
         vec16 result_g;
-        {
-          vec16 dielectric_g:sfract = albedo_g:sfract * oneminusmetalness:sfract;
-          vec16 metal_g:sfract = albedo_g:sfract * metalness:sfract;
-          
-          vec16 specular_g:sfract = rough75_g:sfract * roughness:sfract;
-          specular_g:sfract = rough25_g:sfract +* oneminusroughness:sfract;
-
-          result_g = metal_g:sfract * specular_g:sfract;
-          result_g = dielectric_g:sfract +* diffuse_g:sfract;
-          result_g = specular_g:sfract +* fresnel:sfract;
-          result_g:sfract = VEIGHT:sfract +* result_g:sfract;
-          
-          //result_g:sfract = oneminusmetalness:sfract;
-          //result_g:sfract = specular_g:sfract +* fresnel:sfract;
-        }
-        result_g:sfract = VONE:sfract - result_g:sfract;
-        result_g:sfract = result_g:sfract * result_g:sfract;
-        result_g:sfract = result_g:sfract * result_g:sfract;
-        result_g:sfract = result_g:sfract * result_g:sfract;
-        result_g:sfract = VONE:sfract - result_g:sfract;
-        result_g:sfract = result_g:sfract + dither:sfract;
-
-        // B-Channel
-
         vec16 result_b;
-        {
-          vec16 dielectric_b:sfract = albedo_b:sfract * oneminusmetalness:sfract;
-          vec16 metal_b:sfract = albedo_b:sfract * metalness:sfract;
-          
-          vec16 specular_b:sfract = rough75_b:sfract * roughness:sfract;
-          specular_b:sfract = rough25_b:sfract +* oneminusroughness:sfract;
 
-          result_b:sfract = metal_b:sfract * specular_b:sfract;
-          result_b:sfract = dielectric_b:sfract +* diffuse_b:sfract;
-          result_b:sfract = specular_b:sfract +* fresnel:sfract;
-          result_b:sfract = VEIGHT:sfract +* result_b:sfract;
-          
-          //result_b:sfract = oneminusmetalness:sfract;
-          //result_b:sfract = specular_b:sfract +* fresnel:sfract;
-        }
-        result_b:sfract = VONE:sfract - result_b:sfract;
-        result_b:sfract = result_b:sfract * result_b:sfract;
-        result_b:sfract = result_b:sfract * result_b:sfract;
-        result_b:sfract = result_b:sfract * result_b:sfract;
-        result_b:sfract = VONE:sfract - result_b:sfract;
-        result_b:sfract = result_b:sfract + dither:sfract;
+        specular_r:sfract = spec25_r:sfract * glossiness:sfract;
+        specular_r:sfract = spec75_r:sfract +* oneminusglossiness:sfract;
+        specular_g:sfract = spec25_g:sfract * glossiness:sfract;
+        specular_g:sfract = spec75_g:sfract +* oneminusglossiness:sfract;
+        specular_b:sfract = spec25_b:sfract * glossiness:sfract;
+        specular_b:sfract = spec75_b:sfract +* oneminusglossiness:sfract;
+        albedo_r &= VCONSTS.x;
 
-        // Now we need to pack the result back into 16-bit pixels. We reverse the shifts
-        // current pixels: RRRRRRRRRRRRRRRR, GGGGGGGGGGGGGGGG, BBBBBBBBBBBBBBBB
-        // result should be: RRRRR.GGGGG.BBBBB.0
+        undef oneminusglossiness;
+        vec16 result16bpp;
+
+        albedomultiplier_r = select(diffuse_r, specular_r);
+        albedomultiplier_g = select(diffuse_g, specular_g);
+        albedo_g &= VCONSTS.x;
+        albedomultiplier_b = select(diffuse_b, specular_b);
+
+        result_r:sfract = specular_r:sfract * fresnel:sfract;
+        result_r:sfract = albedo_r:sfract +* albedomultiplier_r:sfract;
+        result_r:sfract = V_HDR_MULTIPLIER:sint * result_r:sfract;
+        albedo_b &= VCONSTS.x;
+        result_g:sfract = specular_g:sfract * fresnel:sfract;
+        result_g:sfract = albedo_g:sfract +* albedomultiplier_g:sfract;
+        result_g:sfract = V_HDR_MULTIPLIER:sint * result_g:sfract;
+        result_r:sfract = VONE:sfract - result_r:sfract;
+        result_b:sfract = specular_b:sfract * fresnel:sfract;
+        result_b:sfract = albedo_b:sfract +* albedomultiplier_b:sfract;
+        result_b:sfract = V_HDR_MULTIPLIER:sint * result_b:sfract;
+        result_g:sfract = VONE:sfract - result_g:sfract;
+        result_r:sfract = result_r:sfract * result_r:sfract;
+        asm_op("lfv", fresnel, 0,  0, fresnelPixels);
+        result_b:sfract = VONE:sfract - result_b:sfract;
+        result_g:sfract = result_g:sfract * result_g:sfract;
+        result_r:sfract = result_r:sfract * result_r:sfract;
+        asm_op("lfv", fresnel, 8, 16, fresnelPixels);
+        fresnelPixels += 96; // to next 8 pixels
+        result_b:sfract = result_b:sfract * result_b:sfract;
+        result_g:sfract = result_g:sfract * result_g:sfract;
+        result_r:sfract = VONE:sfract - result_r:sfract;
+        asm_op("lfv", diffuse_r, 0,  0, diffusePixels);
+        result_b:sfract = result_b:sfract * result_b:sfract;
+        result_g:sfract = VONE:sfract - result_g:sfract;
+        result_r:sfract = result_r:sfract + dither:sfract;
+        asm_op("lfv", diffuse_r, 8, 16, diffusePixels);
+        diffusePixels += 1;
+        result_b:sfract = VONE:sfract - result_b:sfract;
+        result_g:sfract = result_g:sfract + dither:sfract;
         result_r &= VCONSTS.x;
+        asm_op("lfv", spec25_r, 0,  0, spec25Pixels);
+        result_b:sfract = result_b:sfract + dither:sfract;
         result_g &= VCONSTS.x;
-        result_b &= VCONSTS.x;
         result_r <<= 1;
+        asm_op("lfv", spec25_r, 8, 16, spec25Pixels);
+        spec25Pixels += 1;
+        result_b &= VCONSTS.x;
+        result_r |= VCONSTS.y; // set the LSB so that the coverage is not 0, so antialiasing is turned off
         result_g >>= 4;
+        asm_op("lfv", spec75_r, 0,  0, spec75Pixels);
+        asm_op("lfv", spec75_r, 8, 16, spec75Pixels);
+        spec75Pixels += 1;
         result_b >>= 9;
-        vec16 result = result_r | result_g;
-        result |= result_b;
-        result |= VCONSTS.y;
+        // G-Channel
+        result16bpp = result_r | result_g;
+        asm_op("lfv", diffuse_g, 0,  0, diffusePixels);
+        asm_op("lfv", diffuse_g, 8, 16, diffusePixels);
+        diffusePixels += 1;
+        asm_op("lfv", spec25_g, 0,  0, spec25Pixels);
+        result16bpp |= result_b;
+        asm_op("lfv", spec25_g, 8, 16, spec25Pixels);
+        spec25Pixels += 1;
+        asm_op("lfv", spec75_g, 0,  0, spec75Pixels);
+        asm_op("lfv", spec75_g, 8, 16, spec75Pixels);
+        spec75Pixels += 1;
 
-        store(result, destPixels);
-        //store(albedo, destPixels); // to test out the correctness of dma transfers
+        asm_op("lfv", diffuse_b, 0,  0, diffusePixels);
+        asm_op("lfv", diffuse_b, 8, 16, diffusePixels);
+        diffusePixels += 94; // to next 8 pixels in an interleaved buffer
+  
+        asm_op("lfv", spec25_b, 0,  0, spec25Pixels);
+        asm_op("lfv", spec25_b, 8, 16, spec25Pixels);
+        spec25Pixels += 94; // to next 8 pixels
+  
+        asm_op("lfv", spec75_b, 0,  0, spec75Pixels);
+        asm_op("lfv", spec75_b, 8, 16, spec75Pixels);
+        spec75Pixels += 94; // to next 8 pixels
+
+        store(result16bpp, destPixels);
+
+        // to next 8 pixels
+        destPixels += GBUFFER_8PIXEL_OFFSET;
+        pixelcounter -= 8;
       }
-
-      // to next 8 pixels
-      destPixels += RGBA16_BYTES*8;
-      pixelcounter -= 8;
     }
     
     albedoRDRAM += BUFFER_SIZE_GBUFFER;
@@ -452,8 +480,8 @@ command<3> PBRBlendCmd_PostProcess()
     albedoPixels = ALBEDO_BUF2;
     packedPixels = PACKED_BUF2;
     diffusePixels = LIGHTING_BUF2;
-    rough25Pixels = LIGHTING_BUF2; rough25Pixels += 8*RGBA32_BYTES;
-    rough75Pixels = LIGHTING_BUF2; rough75Pixels += 8*RGBA32_BYTES + 8*RGBA32_BYTES;
+    spec25Pixels = LIGHTING_BUF2; spec25Pixels += LIGHTING_8PIXEL_OFFSET;
+    spec75Pixels = LIGHTING_BUF2; spec75Pixels += LIGHTING_16PIXEL_OFFSET;
     destPixels = DEST_BUF2;
     fresnelPixels = LIGHTING_BUF2; fresnelPixels += 3; // fresnel factor is stored as an alpha channel in any lighting buffer, 
     // so add 3 bytes to the DMEM buffer pointer
@@ -461,248 +489,311 @@ command<3> PBRBlendCmd_PostProcess()
     pixelcounter = BUFFER_PIXELS;
     // TODO: not finished
     // combine 8 pixels of albedo+packed+lighting at a time
-    while(pixelcounter > 0){
-      vec16 albedo = load(albedoPixels); /* albedo: RRRRR.GGGGG.BBBBB.A */
-      vec16 packed = load(packedPixels); /* packed: rrrrr.YYYYY.XXXX0.M */
-      albedoPixels += RGBA16_BYTES*8;
-      packedPixels += RGBA16_BYTES*8;
+    // combine 8 pixels of albedo+packed+lighting at a time
+    {
+      // define all the vectors used beforehand
+      // diffuse lighting
+      vec16 diffuse_r;
+      vec16 diffuse_g;
+      vec16 diffuse_b;
+      // specular glossiness 0.25 lighting
+      vec16 spec25_r;
+      vec16 spec25_g;
+      vec16 spec25_b;
+      // specular glossiness 0.75 lighting
+      vec16 spec75_r;
+      vec16 spec75_g;
+      vec16 spec75_b;
+      // albedo RGB factor
+      vec16 albedo_r;
+      vec16 albedo_g;
+      vec16 albedo_b;
+      // glossiness factor
+      vec16 glossiness;
+      // fresnel factor (f0 - 1.0 range)
+      vec16 fresnel;
 
-      // Isolate R,G,B components of albedo. Since we want to handle saturation during multiplication,
-      // we need to scale each component into a 16-bit unsigned fraction, which means
-      // that the 5-bit components must go into bits 14..10. Thus:
-      // 
-      // R is at 15..11, so it must be shift right by 1
-      // G is at 10..6, so it must be shift left by 4
-      // B is at 5..1, so it must be shift left by 9
-      vec16 albedo_r = albedo >> 1;
-      vec16 albedo_g = albedo << 4;
-      vec16 albedo_b = albedo << 9;
-
-      // Keep only correct bits
-      albedo_r &= VCONSTS.x;
-      albedo_g &= VCONSTS.x;
-      albedo_b &= VCONSTS.x;
-
-      // Now isolate the roughness and metalness components
-      // roughness is at 15..11, so it must be shift right by 1
-      vec16 roughness = packed >> 1;
-      roughness &= VCONSTS.x;
-
-      // Metalness is a 1-bit lsb 00000.00000.00000.M, shift left by 15 to get u1.15 sfract
-      vec16 metalness:sint = packed & VCONSTS.y;
-      metalness:sfract = metalness:sint * VONE:sfract;  // to 0.99999
-      
-      // VONE is 01111111.11111111 s1.15
-      vec16 oneminusroughness:sfract = VONE:sfract - roughness:sfract;
-      vec16 oneminusmetalness:sfract = VONE:sfract - metalness:sfract;
-      
-      undef packed;
+      // Load the lighting buffers:
       // for each color channel, we need to load the 3 lighting pixels
       // also we need a fresnel factor from the lighting buffer
-      // 8 pixels of a single channel from RGBA32 need to be loaded into 3 vectors, and the A channeel into another vector
+      // 8 pixels of a single channel from RGBA32 need to be loaded into 3 vectors, and the A channel into another vector
       // "lfv" will load every 4th byte, starting from a pointer
       // The vectors look like this:
       // [D0 D1 ... D6 D7] 
       // [R25_0 R25_1 ... R25_6 R25_7] 
       // [R75_0 R75_1 ... R75_6 R75_7]
       // [F0 F1 ... F6 F7]
+
       // We need to load the fresnel vector only once, not per channel, so do that first
-    
       // lfv will load strided bytes into bits 14..7, so fresnel can be treated as u1.15 sfract directly
-      vec16 fresnel;
-      @Barrier("fresnel") 
+      //@Barrier("fresnel") 
       asm_op("lfv", fresnel, 0,  0, fresnelPixels);
-      @Barrier("fresnel") 
+      //@Barrier("fresnel") 
       asm_op("lfv", fresnel, 8, 16, fresnelPixels);
       fresnelPixels += 96; // to next 8 pixels
+      
+      // lfv will load strided bytes into bits 14..7 so they can be treated as u1.15 as well
+      // R-Channel
+      //@Barrier("rgba32_r") 
+      asm_op("lfv", diffuse_r, 0,  0, diffusePixels);
+      //@Barrier("rgba32_r") 
+      asm_op("lfv", diffuse_r, 8, 16, diffusePixels);
+      diffusePixels += 1;
 
-      {
-        // load the lighting buffers
-        vec16 diffuse_r;
-        vec16 diffuse_g;
-        vec16 diffuse_b;
+      //@Barrier("rgba32_r") 
+      asm_op("lfv", spec25_r, 0,  0, spec25Pixels);
+      //@Barrier("rgba32_r") 
+      asm_op("lfv", spec25_r, 8, 16, spec25Pixels);
+      spec25Pixels += 1;
 
-        vec16 rough25_r;
-        vec16 rough25_g;
-        vec16 rough25_b;
+      //@Barrier("rgba32_r") 
+      asm_op("lfv", spec75_r, 0,  0, spec75Pixels);
+      //@Barrier("rgba32_r") 
+      asm_op("lfv", spec75_r, 8, 16, spec75Pixels);
+      spec75Pixels += 1;
 
-        vec16 rough75_r;
-        vec16 rough75_g;
-        vec16 rough75_b;
+      // G-Channel
+
+      //@Barrier("rgba32_g") 
+      asm_op("lfv", diffuse_g, 0,  0, diffusePixels);
+      //@Barrier("rgba32_g") 
+      asm_op("lfv", diffuse_g, 8, 16, diffusePixels);
+      diffusePixels += 1;
+
+      //@Barrier("rgba32_g") 
+      asm_op("lfv", spec25_g, 0,  0, spec25Pixels);
+      //@Barrier("rgba32_g") 
+      asm_op("lfv", spec25_g, 8, 16, spec25Pixels);
+      spec25Pixels += 1;
+
+      //@Barrier("rgba32_g") 
+      asm_op("lfv", spec75_g, 0,  0, spec75Pixels);
+      //@Barrier("rgba32_g") 
+      asm_op("lfv", spec75_g, 8, 16, spec75Pixels);
+      spec75Pixels += 1;
+
+      //@Barrier("rgba32_b") 
+      asm_op("lfv", diffuse_b, 0,  0, diffusePixels);
+      //@Barrier("rgba32_b") 
+      asm_op("lfv", diffuse_b, 8, 16, diffusePixels);
+      diffusePixels += 94; // to next 8 pixels in an interleaved buffer
+
+      //@Barrier("rgba32_b") 
+      asm_op("lfv", spec25_b, 0,  0, spec25Pixels);
+      //@Barrier("rgba32_b") 
+      asm_op("lfv", spec25_b, 8, 16, spec25Pixels);
+      spec25Pixels += 94; // to next 8 pixels
+
+      //@Barrier("rgba32_b") 
+      asm_op("lfv", spec75_b, 0,  0, spec75Pixels);
+      //@Barrier("rgba32_b") 
+      asm_op("lfv", spec75_b, 8, 16, spec75Pixels);
+      spec75Pixels += 94; // to next 8 pixels
+
+      while(pixelcounter > 0){
+        // load the g-buffers
+        vec16 albedo = load(albedoPixels); /* albedo: RRRRR.GGGGG.BBBBB.A */
+        vec16 packed = load(packedPixels); /* packed: Mgggg.YYYYY.XXXX0.0 */
         
-        // lfv will load strided bytes into bits 14..7 so they can be treated as u1.15 as well
-        // R-Channel
-        @Barrier("rgba32_r") 
-        asm_op("lfv", diffuse_r, 0,  0, diffusePixels);
-        @Barrier("rgba32_r") 
-        asm_op("lfv", diffuse_r, 8, 16, diffusePixels);
-        diffusePixels += 1;
+        // to next 8 pixels of the g-buffer
+        albedoPixels += GBUFFER_8PIXEL_OFFSET;
+        packedPixels += GBUFFER_8PIXEL_OFFSET;
   
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough25_r, 0,  0, rough25Pixels);
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough25_r, 8, 16, rough25Pixels);
-        rough25Pixels += 1;
-  
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough75_r, 0,  0, rough75Pixels);
-        @Barrier("rgba32_r") 
-        asm_op("lfv", rough75_r, 8, 16, rough75Pixels);
-        rough75Pixels += 1;
-
-        // G-Channel
-
-        @Barrier("rgba32_g") 
-        asm_op("lfv", diffuse_g, 0,  0, diffusePixels);
-        @Barrier("rgba32_g") 
-        asm_op("lfv", diffuse_g, 8, 16, diffusePixels);
-        diffusePixels += 1;
-  
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough25_g, 0,  0, rough25Pixels);
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough25_g, 8, 16, rough25Pixels);
-        rough25Pixels += 1;
-  
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough75_g, 0,  0, rough75Pixels);
-        @Barrier("rgba32_g") 
-        asm_op("lfv", rough75_g, 8, 16, rough75Pixels);
-        rough75Pixels += 1;
-
         // B-Channel
 
-        @Barrier("rgba32_b") 
-        asm_op("lfv", diffuse_b, 0,  0, diffusePixels);
-        @Barrier("rgba32_b") 
-        asm_op("lfv", diffuse_b, 8, 16, diffusePixels);
-        diffusePixels += 94; // to next 8 pixels in an interleaved buffer
-  
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough25_b, 0,  0, rough25Pixels);
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough25_b, 8, 16, rough25Pixels);
-        rough25Pixels += 94; // to next 8 pixels
-  
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough75_b, 0,  0, rough75Pixels);
-        @Barrier("rgba32_b") 
-        asm_op("lfv", rough75_b, 8, 16, rough75Pixels);
-        rough75Pixels += 94; // to next 8 pixels
+        // Isolate the glossiness component
+        // glossiness is at 15..11, so we can just cut the msb and everything else
+        glossiness = packed & VCONSTS.w;
 
-        // Now we need to add all the lighting together:
+        // Isolate R,G,B components of albedo. Since we want to handle correct multiplication,
+        // we need to scale each component into a 16-bit signed fraction, which means
+        // that the 5-bit components must go into bits 14..10. Thus:
+        // 
+        // R is at 15..11, so it must be shift right by 1
+        // G is at 10..6, so it must be shift left by 4
+        // B is at 5..1, so it must be shift left by 9
+
+        albedo_r = albedo >> 1;
+        albedo_g = albedo << 4;
+        albedo_b = albedo << 9;
+
+        undef albedo;
+        // Since metalness is 1-bit, we can select the correct multiplier for albedo by using the compare opcode
+        // If metalness == 0, then we'll select the diffuse, otherwise we'll select specular, which will be multiplied by albedo
+        // Metalness is a 1-bit lsb M0000.00000.00000.0, we can just AND with 0x8000
+        vec16 metalness = packed & VCONSTS.Y;
+        undef packed;
+        vec16 metalnessselect = metalness == 0;
+
+        undef metalnessselect;
+        undef metalness;
+        
+        // VONE is 0.9999 in s1.15
+        vec16 oneminusglossiness:sfract = VONE:sfract - glossiness:sfract;
+
+        // Then we need to add all the lighting together:
         //
-        // albedo/metal/roughness assumed sfract vectors,
+        // albedo/metal/glossiness assumed sfract vectors,
         // specular/diffuse assumed sfract vectors
         //
         // The general approximated formula for combining the lighting is:
         //
-        // specular = rough75 * roughness + (rough25 * (1 - roughness)); // linear interpolation between shiny and matte specular
+        // specular = spec25 * glossiness + (spec75 * (1 - glossiness)); // linear interpolation between matte and shiny specular
         // metal = albedo * specular * metalness // metallic portion
         // dielectric = albedo * diffuse * (1 - metalness) // dielectric diffuse portion
         // result = specular * fresnel + metal + dielectric // add all the components + fresnel specular
         //
         // Technically fresnel coefficients should be different for 
-        // roughness = 0.25 and roughness 0.75, but is assumed 0.25 to reduce instructions
+        // glossiness = 0.25 and glossiness 0.75, but is assumed 0.25 to reduce instructions
         // 
-        // the result should be sfract multiplied by 8 
-        // so that the 3.5 HDR lighting is preserved and the value is saturated
+        // the result should be tonemapped down to SDR using a formula of [1 - (1 - 0.125x)^4] where x is the HDR color
+        // so that the u3.5 HDR lighting is preserved and the value is saturated
+        //
+        // Then we need to pack the result back into 16-bit pixels. We reverse the shifts
+        // result pixels: 0RRRRRRRRRRRRRRR, 0GGGGGGGGGGGGGGG, 0BBBBBBBBBBBBBBB
+        // 16bpp should be: RRRRR.GGGGG.BBBBB.0
+        //
+        // In parallel, we need to load the lighting buffers for the next loop:
+        // for each color channel, we need to load the 3 lighting pixels
+        // also we need a fresnel factor from the lighting buffer
+        // 8 pixels of a single channel from RGBA32 need to be loaded into 3 vectors, and the A channel into another vector
+        // "lfv" will load every 4th byte, starting from a pointer
+        // The vectors look like this:
+        // [D0 D1 ... D6 D7] 
+        // [R25_0 R25_1 ... R25_6 R25_7] 
+        // [R75_0 R75_1 ... R75_6 R75_7]
+        // [F0 F1 ... F6 F7]
+        // We need to load the fresnel vector only once, not per channel, so do that first
+        // lfv will load strided bytes into bits 14..7, so fresnel can be treated as u1.15 sfract directly
 
-        // R-Channel
+        // The code below is very interleaved to minimize VU stalls, also in parallel it will load the next 8 pixels
+
+        //result16bpp = VCONSTS.y; // set the LSB so that the coverage is not 0, so antialiasing is turned off
+        // specular lighting = lerp(spec75, spec25, glossiness)
+        vec16 specular_r;
+        vec16 specular_g;
+        vec16 specular_b;
+        // albedo * (metalness? specular : diffuse) 
+        vec16 albedomultiplier_r;  
+        vec16 albedomultiplier_g;
+        vec16 albedomultiplier_b;
+
+        // combined result
         vec16 result_r;
-        {
-          vec16 dielectric_r:sfract = albedo_r:sfract * oneminusmetalness:sfract;
-          vec16 metal_r:sfract = albedo_r:sfract * metalness:sfract;
-        
-          vec16 specular_r:sfract = rough75_r:sfract * roughness:sfract;
-          specular_r:sfract = rough25_r:sfract +* oneminusroughness:sfract;
-
-          result_r:sfract = metal_r:sfract * specular_r:sfract;
-          result_r:sfract = dielectric_r:sfract +* diffuse_r:sfract;
-          result_r:sfract = specular_r:sfract +* fresnel:sfract;
-          result_r:sfract = VEIGHT:sfract +* result_r:sfract;
-          
-          //result_r:sfract = oneminusmetalness:sfract;
-          //result_r:sfract = specular_r:sfract +* fresnel:sfract;
-        }
-        result_r:sfract = VONE:sfract - result_r:sfract;
-        result_r:sfract = result_r:sfract * result_r:sfract;
-        result_r:sfract = result_r:sfract * result_r:sfract;
-        result_r:sfract = result_r:sfract * result_r:sfract;
-        result_r:sfract = VONE:sfract - result_r:sfract;
-        
-        result_r:sfract = result_r:sfract + dither:sfract;
-
-        // G-Channel
-        
         vec16 result_g;
-        {
-          vec16 dielectric_g:sfract = albedo_g:sfract * oneminusmetalness:sfract;
-          vec16 metal_g:sfract = albedo_g:sfract * metalness:sfract;
-          
-          vec16 specular_g:sfract = rough75_g:sfract * roughness:sfract;
-          specular_g:sfract = rough25_g:sfract +* oneminusroughness:sfract;
-
-          result_g = metal_g:sfract * specular_g:sfract;
-          result_g = dielectric_g:sfract +* diffuse_g:sfract;
-          result_g = specular_g:sfract +* fresnel:sfract;
-          result_g:sfract = VEIGHT:sfract +* result_g:sfract;
-          
-          //result_g:sfract = oneminusmetalness:sfract;
-          //result_g:sfract = specular_g:sfract +* fresnel:sfract;
-        }
-        result_g:sfract = VONE:sfract - result_g:sfract;
-        result_g:sfract = result_g:sfract * result_g:sfract;
-        result_g:sfract = result_g:sfract * result_g:sfract;
-        result_g:sfract = result_g:sfract * result_g:sfract;
-        result_g:sfract = VONE:sfract - result_g:sfract;
-        result_g:sfract = result_g:sfract + dither:sfract;
-
-        // B-Channel
-
         vec16 result_b;
-        {
-          vec16 dielectric_b:sfract = albedo_b:sfract * oneminusmetalness:sfract;
-          vec16 metal_b:sfract = albedo_b:sfract * metalness:sfract;
-          
-          vec16 specular_b:sfract = rough75_b:sfract * roughness:sfract;
-          specular_b:sfract = rough25_b:sfract +* oneminusroughness:sfract;
 
-          result_b:sfract = metal_b:sfract * specular_b:sfract;
-          result_b:sfract = dielectric_b:sfract +* diffuse_b:sfract;
-          result_b:sfract = specular_b:sfract +* fresnel:sfract;
-          result_b:sfract = VEIGHT:sfract +* result_b:sfract;
-          
-          //result_b:sfract = oneminusmetalness:sfract;
-          //result_b:sfract = specular_b:sfract +* fresnel:sfract;
-        }
-        result_b:sfract = VONE:sfract - result_b:sfract;
-        result_b:sfract = result_b:sfract * result_b:sfract;
-        result_b:sfract = result_b:sfract * result_b:sfract;
-        result_b:sfract = result_b:sfract * result_b:sfract;
-        result_b:sfract = VONE:sfract - result_b:sfract;
-        result_b:sfract = result_b:sfract + dither:sfract;
+        specular_r:sfract = spec25_r:sfract * glossiness:sfract;
+        specular_r:sfract = spec75_r:sfract +* oneminusglossiness:sfract;
+        specular_g:sfract = spec25_g:sfract * glossiness:sfract;
+        specular_g:sfract = spec75_g:sfract +* oneminusglossiness:sfract;
+        specular_b:sfract = spec25_b:sfract * glossiness:sfract;
+        specular_b:sfract = spec75_b:sfract +* oneminusglossiness:sfract;
+        albedo_r &= VCONSTS.x;
 
-        // Now we need to pack the result back into 16-bit pixels. We reverse the shifts
-        // current pixels: RRRRRRRRRRRRRRRR, GGGGGGGGGGGGGGGG, BBBBBBBBBBBBBBBB
-        // result should be: RRRRR.GGGGG.BBBBB.0
+        undef oneminusglossiness;
+        vec16 result16bpp;
+
+        albedomultiplier_r = select(diffuse_r, specular_r);
+        albedomultiplier_g = select(diffuse_g, specular_g);
+        albedo_g &= VCONSTS.x;
+        albedomultiplier_b = select(diffuse_b, specular_b);
+
+        result_r:sfract = specular_r:sfract * fresnel:sfract;
+        result_r:sfract = albedo_r:sfract +* albedomultiplier_r:sfract;
+        result_r:sfract = V_HDR_MULTIPLIER:sint * result_r:sfract;
+        albedo_b &= VCONSTS.x;
+        result_g:sfract = specular_g:sfract * fresnel:sfract;
+        result_g:sfract = albedo_g:sfract +* albedomultiplier_g:sfract;
+        result_g:sfract = V_HDR_MULTIPLIER:sint * result_g:sfract;
+        result_r:sfract = VONE:sfract - result_r:sfract;
+        result_b:sfract = specular_b:sfract * fresnel:sfract;
+        result_b:sfract = albedo_b:sfract +* albedomultiplier_b:sfract;
+        result_b:sfract = V_HDR_MULTIPLIER:sint * result_b:sfract;
+        result_g:sfract = VONE:sfract - result_g:sfract;
+        result_r:sfract = result_r:sfract * result_r:sfract;
+        //@Barrier("fresnel") 
+        asm_op("lfv", fresnel, 0,  0, fresnelPixels);
+        result_b:sfract = VONE:sfract - result_b:sfract;
+        result_g:sfract = result_g:sfract * result_g:sfract;
+        result_r:sfract = result_r:sfract * result_r:sfract;
+        //@Barrier("fresnel") 
+        asm_op("lfv", fresnel, 8, 16, fresnelPixels);
+        fresnelPixels += 96; // to next 8 pixels
+        result_b:sfract = result_b:sfract * result_b:sfract;
+        result_g:sfract = result_g:sfract * result_g:sfract;
+        result_r:sfract = VONE:sfract - result_r:sfract;
+        //@Barrier("rgba32_r") 
+        asm_op("lfv", diffuse_r, 0,  0, diffusePixels);
+        result_b:sfract = result_b:sfract * result_b:sfract;
+        result_g:sfract = VONE:sfract - result_g:sfract;
+        result_r:sfract = result_r:sfract + dither:sfract;
+        //@Barrier("rgba32_r") 
+        asm_op("lfv", diffuse_r, 8, 16, diffusePixels);
+        diffusePixels += 1;
+        result_b:sfract = VONE:sfract - result_b:sfract;
+        result_g:sfract = result_g:sfract + dither:sfract;
         result_r &= VCONSTS.x;
+        //@Barrier("rgba32_r") 
+        asm_op("lfv", spec25_r, 0,  0, spec25Pixels);
+        result_b:sfract = result_b:sfract + dither:sfract;
         result_g &= VCONSTS.x;
-        result_b &= VCONSTS.x;
         result_r <<= 1;
+        //@Barrier("rgba32_r") 
+        asm_op("lfv", spec25_r, 8, 16, spec25Pixels);
+        spec25Pixels += 1;
+        result_b &= VCONSTS.x;
+        result_r |= VCONSTS.y;
         result_g >>= 4;
+        //@Barrier("rgba32_r") 
+        asm_op("lfv", spec75_r, 0,  0, spec75Pixels);
+        //@Barrier("rgba32_r") 
+        asm_op("lfv", spec75_r, 8, 16, spec75Pixels);
+        spec75Pixels += 1;
         result_b >>= 9;
-        vec16 result = result_r | result_g;
-        result |= result_b;
-        result |= VCONSTS.y;
+        // G-Channel
+        result16bpp = result_r | result_g;
+        //@Barrier("rgba32_g") 
+        asm_op("lfv", diffuse_g, 0,  0, diffusePixels);
+        //@Barrier("rgba32_g") 
+        asm_op("lfv", diffuse_g, 8, 16, diffusePixels);
+        diffusePixels += 1;
+        //@Barrier("rgba32_g") 
+        asm_op("lfv", spec25_g, 0,  0, spec25Pixels);
+        result16bpp |= result_b;
+        //@Barrier("rgba32_g") 
+        asm_op("lfv", spec25_g, 8, 16, spec25Pixels);
+        spec25Pixels += 1;
+        //@Barrier("rgba32_g") 
+        asm_op("lfv", spec75_g, 0,  0, spec75Pixels);
+        //@Barrier("rgba32_g") 
+        asm_op("lfv", spec75_g, 8, 16, spec75Pixels);
+        spec75Pixels += 1;
+        //@Barrier("rgba32_b") 
 
-        store(result, destPixels);
-        //store(albedo, destPixels); // to test out the correctness of dma transfers
+        asm_op("lfv", diffuse_b, 0,  0, diffusePixels);
+        //@Barrier("rgba32_b") 
+        asm_op("lfv", diffuse_b, 8, 16, diffusePixels);
+        diffusePixels += 94; // to next 8 pixels in an interleaved buffer
+  
+        //@Barrier("rgba32_b") 
+        asm_op("lfv", spec25_b, 0,  0, spec25Pixels);
+        //@Barrier("rgba32_b") 
+        asm_op("lfv", spec25_b, 8, 16, spec25Pixels);
+        spec25Pixels += 94; // to next 8 pixels
+  
+        //@Barrier("rgba32_b") 
+        asm_op("lfv", spec75_b, 0,  0, spec75Pixels);
+        //@Barrier("rgba32_b") 
+        asm_op("lfv", spec75_b, 8, 16, spec75Pixels);
+        spec75Pixels += 94; // to next 8 pixels
+
+        store(result16bpp, destPixels);
+
+        // to next 8 pixels
+        destPixels += GBUFFER_8PIXEL_OFFSET;
+        pixelcounter -= 8;
       }
-
-      // to next 8 pixels
-      destPixels += RGBA16_BYTES*8;
-      pixelcounter -= 8;
     }
     {
       u32 bufferscounter = load(SRC_PIXELS_ITERATIONS);
@@ -719,31 +810,3 @@ postprocess_end:
   dmaAwait();
   
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

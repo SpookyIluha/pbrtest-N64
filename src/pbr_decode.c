@@ -5,192 +5,15 @@
 
 #include "pbr_decode.h"
 #include "pbr_u88.h"
-/*
-const uint16_t *sprite_pixels_u16(const sprite_t *spr)
-{
-    return (const uint16_t *)spr->data;
-}
-
-bool sprite_dim_match(const sprite_t *spr, int w, int h)
-{
-    return spr && spr->width == w && spr->height == h;
-}
-
-static inline void unpack_rgba16_to_u16x3(uint16_t c, uint16_t out_rgb[3])
-{
-    uint16_t r5 = (c >> 11) & 0x1Fu;
-    uint16_t g5 = (c >> 6)  & 0x1Fu;
-    uint16_t b5 = (c >> 1)  & 0x1Fu;
-
-    // Expand 5-bit albedo to u8.8 fixed [0..256]. 
-    out_rgb[0] = (uint16_t)((r5 * U88_ONE + 15u) >> 5);
-    out_rgb[1] = (uint16_t)((g5 * U88_ONE + 15u) >> 5);
-    out_rgb[2] = (uint16_t)((b5 * U88_ONE + 15u) >> 5);
-}
-
-static inline uint16_t u26_to_u88(uint8_t v26)
-{
-    return (uint16_t)v26 << 2; // u2.6 -> u8.8 
-}
-
-static inline uint16_t u08_to_u88(uint8_t v08)
-{
-    return (uint16_t)((((uint32_t)v08 * U88_ONE) + 127u) / 255u);
-}
-
-static inline uint16_t pack_rgb5551_from_u88(uint16_t r88, uint16_t g88, uint16_t b88)
-{
-    // Linear clamp to [0,1] in u8.8, then map to RGB555. 
-    if (r88 > U88_ONE) r88 = U88_ONE;
-    if (g88 > U88_ONE) g88 = U88_ONE;
-    if (b88 > U88_ONE) b88 = U88_ONE;
-
-    uint16_t r5 = (uint16_t)((r88 * 31u + 128u) >> 8);
-    uint16_t g5 = (uint16_t)((g88 * 31u + 128u) >> 8);
-    uint16_t b5 = (uint16_t)((b88 * 31u + 128u) >> 8);
-
-    return (uint16_t)((r5 << 11) | (g5 << 6) | (b5 << 1) | 1u);
-}
-
-void combine_deferred_cpu(const uint16_t *albedo_rgba16,
-                          const uint16_t *packed16,
-                          uint16_t *out_rgba16,
-                          int w,
-                          int h,
-                          const MatcapSet *mats)
-{
-    size_t n = (size_t)w * (size_t)h;
-    for (size_t i = 0; i < n; i++) {
-        const uint16_t a = albedo_rgba16[i];
-
-        if ((a & 0x0001u) == 0) {
-            out_rgba16[i] = a;
-            continue;
-        }
-
-        uint8_t albedo16[3];
-        // albedo: RRRRRGGGGGBBBBBA
-        albedo16[0] = (a >> 8) & 0xF8u;
-        albedo16[1] = (a >> 3) & 0xF8u;
-        albedo16[2] = (a << 2) & 0xF8u;
-
-        const uint16_t p = packed16[i];
-        // packed16: RRRRRYYYY0XXXX0M
-        const uint8_t roughness = (uint8_t)((p >> 8) & 0xF8u);
-        const uint8_t tex_idx = (uint8_t)(((p >> 2) & 0x0Fu) | ((p >> 3) & 0xF0u));
-        const uint16_t m = (uint16_t)((p & 0x01u) << 8); // either 1.0 fixed or 0.0 fixed
-        const uint16_t onem_roughness = U88_ONE - roughness;
-        const uint16_t onem_m = U88_ONE - m;
-
-        // sample matcaps
-        const matcap_rgba_t *diff = &mats->diffuse[tex_idx];
-        const matcap_rgba_t *spec_lo = &mats->rough25[tex_idx];
-        const matcap_rgba_t *spec_hi = &mats->rough75[tex_idx];
-
-        const uint16_t diff_rgb[3] = {
-            (uint16_t)(diff->c[0]),
-            (uint16_t)(diff->c[1]),
-            (uint16_t)(diff->c[2])
-        };
-        const uint16_t spec_lo_rgb[3] = {
-            (uint16_t)(spec_lo->c[0]),
-            (uint16_t)(spec_lo->c[1]),
-            (uint16_t)(spec_lo->c[2])
-        };
-        const uint16_t spec_hi_rgb[3] = {
-            (uint16_t)(spec_hi->c[0]),
-            (uint16_t)(spec_hi->c[1]),
-            (uint16_t)(spec_hi->c[2])
-        };
-        const uint16_t fresnel = (uint16_t)(spec_lo->c[3]); // u0.8
-
-        uint16_t out_c[3];
-        for (int c = 0; c < 3; c++) {
-            const uint16_t diff = (diff_rgb[c]) << 2;  // u2.6
-            const uint16_t spec_lo = (spec_lo_rgb[c]) << 2;
-            const uint16_t spec_hi = (spec_hi_rgb[c]) << 2;
-
-            // u88 lerp using roughness as u0.8 factor.
-            const uint16_t spec_high_fac = u88_mul(spec_hi, roughness);
-            const uint16_t spec_low_fac = u88_mul(spec_lo, onem_roughness);
-            const uint16_t specular = u88_add_sat(spec_low_fac, spec_high_fac);
-
-            // fresnel factor
-            const uint16_t specular_fres = u88_mul(fresnel, (uint16_t)specular);
-
-            // metal factor 
-            uint16_t metal = u88_mul(albedo16[c], (uint16_t)specular);
-            metal = u88_mul(metal, m); // either 0 or 1 in u8.8
-        
-            // dielectric factor 
-            uint16_t dielectic = u88_mul(albedo16[c], diff);
-            dielectic = u88_mul(dielectic, onem_m); // either 0 or 1 in u8.8 
-
-            // combine all shading 
-            uint16_t shaded = u88_add_sat(dielectic, specular_fres);
-            shaded = u88_add_sat(shaded, metal);
-
-            out_c[c] = shaded;
-        }
-
-        out_rgba16[i] = pack_rgb5551_from_u88(out_c[0], out_c[1], out_c[2]);
-    }
-}
-
-#define CACHE_OP_DIRTY ((0x3 << 2) | 0x1)
-#define CACHE_OP_FLUSH ((0x5 << 2) | 0x1)
-
-void decode_deferred_cpu(const uint16_t *packed16,
-                          uint32_t *out_diffuse,
-                          uint32_t *out_rough25,
-                          uint32_t *out_rough75,
-                          int w,
-                          int h,
-                          const MatcapSet *mats)
-{
-    register size_t n = (size_t)w * (size_t)h;
-    register uint8_t *matcap_diffuse = (uint8_t *)mats->diffuse;
-    register uint8_t *matcap_rough25 = (uint8_t *)mats->rough25;
-    register uint8_t *matcap_rough75 = (uint8_t *)mats->rough75;
-
-    // try to precache the matcaps into CPU's cache:
-    for(int i = 0; i < MATCAP_SIZE*MATCAP_SIZE/2; i+=4)
-    {
-        register uint64_t d = matcap_diffuse[i];
-        register uint64_t s25 = matcap_rough25[i];
-        register uint64_t s75 = matcap_rough75[i];
-        (void)d;
-        (void)s25;
-        (void)s75;
-    }
-
-    // decode the packed buffer into matcap buffers, so the RSP doesn't have to decode it
-    for (register size_t i = 0; i < n; i++) {
-        const register uint16_t a = packed16[i];        // ERRRRYYYY0XXXX0M
-        register uint16_t index = 0;
-        if(a & 0x8000) {
-            const register uint16_t indexy = (a >> 1) & 0b0000001111000000; // 000000YYYY000000
-            index = (uint16_t)((a & 0b0000000000111100) | indexy);
-        }
-
-        out_diffuse[i] = *(uint32_t*)&matcap_diffuse[index];
-        out_rough25[i] = *(uint32_t*)&matcap_rough25[index];
-        out_rough75[i] = *(uint32_t*)&matcap_rough75[index];
-    }
-
-}*/
 
 #define CACHE_OP_DIRTY ((0x3 << 2) | 0x1)
 #define CACHE_OP_FLUSH ((0x5 << 2) | 0x1)
 
 static inline uint16_t packed_to_matcap_byte_index(const uint16_t p)
 {
-    // Packed layout: RRRRRXXXXXYYYY0M
+    // Packed layout: MRRRRXXXXXYYYY0E
     // Transposed matcap: normal.x(5) -> Y, normal.y(4) -> X
-    if(p & 0b11110'00000'00000'0) {
-        return p & 0b00000'11111'11110'0; // 00000YYYYYXXXX00
-    }
-    return 0;
+    return p & 0b00000'11111'11110'0; // 00000YYYYYXXXX00
 }
 
 static inline uint32_t load_matcap_u32(const uint8_t *base, const uint16_t byte_index)
@@ -198,28 +21,74 @@ static inline uint32_t load_matcap_u32(const uint8_t *base, const uint16_t byte_
     return *(const uint32_t *)&base[byte_index];
 }
 
-static inline void copy_16bytes(void *dst, const void *src)
+// Instruction cache defines.
+#define CACHE_INST_FLAG                 (0)
+#define CACHE_INST_SIZE                 (16 * 1024)
+#define CACHE_INST_LINESIZE             (32)
+// Data cache defines.
+#define CACHE_DATA_FLAG                 (1)
+#define CACHE_DATA_SIZE                 (8 * 1024)
+#define CACHE_DATA_LINESIZE             (16)
+// Cache ops described in VR4300 manual on page 404.
+#define INDEX_INVALIDATE                (0)
+#define INDEX_LOAD_TAG                  (1)
+#define INDEX_STORE_TAG                 (2)
+#define INDEX_CREATE_DIRTY              (3)
+#define HIT_INVALIDATE                  (4)
+#define HIT_WRITEBACK_INVALIDATE        (5)
+#define HIT_WRITEBACK                   (6)
+
+#define CACHE_OP_DIRTY ((0x3 << 2) | 0x1)
+#define CACHE_OP_FLUSH ((0x5 << 2) | 0x1)
+
+/**
+ * @brief Helper macro to perform cache refresh operations
+ *
+ * @param[in] op
+ *            Operation to perform
+ * @param[in] linesize
+ *            Size of a cacheline in bytes
+ */
+#define cache_op(op, linesize) ({ \
+    if (length) { \
+        void *cur = (void*)((unsigned long)addr & ~(linesize-1)); \
+        int count = (int)length + (addr-cur); \
+        for (int i = 0; i < count; i += linesize) \
+            asm ("\tcache %0,(%1)\n"::"i" (op), "r" (cur+i)); \
+    } \
+})
+
+/**
+ * @brief Helper macro to create the opcode for a cache operation.
+ * Operation is encoded in 5 bits where bits 4..2 contain the operation type
+ * and bits 0..1 determine the cache that is to be operated on. 
+ * 
+ * @param[in] op
+ *            Operation type to perform.
+ * @param[in] cache
+ *            Specific cache to perform the operation on.
+ */
+#define build_opcode(op, cache)             (((op) << 2) | (cache))
+
+void inline data_cache_prepare_for_write_local(volatile void *addr, unsigned long length)
 {
-    memcpy(dst, src, 16);
+    cache_op(build_opcode(INDEX_CREATE_DIRTY, CACHE_DATA_FLAG), CACHE_DATA_LINESIZE);
 }
 
-void decode_packed_cpu(const uint16_t *packed16,
-                          uint32_t *out_diffuse,
-                          uint32_t *out_rough25,
-                          uint32_t *out_rough75,
-                          int w,
-                          int h,
-                          const MatcapSet *mats)
+void cpu_decode_packed_to_interleaved_lighting(const uint16_t *packed16,
+                                             uint32_t *out_lighting_interleaved,
+                                             int w,
+                                             int h,
+                                             const MatcapSet *mats)
 {
-    size_t n = (size_t)w * (size_t)h;
+    const size_t n = (size_t)w * (size_t)h;
+    assertf((n % DECODE_INTERLEAVED8_PIXELS) == 0,
+            "decode_packed_to_interleaved_lighting: pixel count must be multiple of 8");
 
-    // treat the matcaps as if they were 8-bit so we don't need to do a srl >> 2 in a loop
-    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
-    const uint8_t *matcap_rough25 = (const uint8_t *)mats->rough25;
-    const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
     // Matcaps are stored as 16x32 transposed:
+    // They're transposed so that there's more horizontal resolution, than vertical
     // packed normal.x (5-bit) -> matcap Y, packed normal.y (4-bit) -> matcap X.
-    // Packed layout here is: RRRRRXXXXXYYYY0M.
+    // Packed layout here is: RRRRRXXXXXYYYY0M
 
     // try to precache the matcaps into CPU's cache:
     // 16x32 matcaps are 6KB which still fits into CPU's cache
@@ -227,180 +96,50 @@ void decode_packed_cpu(const uint16_t *packed16,
     /*for(int i = 0; i < MATCAP_SIZE*MATCAP_SIZE*2*4; i+=8)
     {
         register uint64_t d = matcap_diffuse[i];
-        register uint64_t s25 = matcap_rough25[i];
-        register uint64_t s75 = matcap_rough75[i];
+        register uint64_t s25 = matcap_spec25[i];
+        register uint64_t s75 = matcap_spec75[i];
         (void)d;
         (void)s25;
         (void)s75;
     }*/
 
+    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
+    const uint8_t *matcap_spec25 = (const uint8_t *)mats->spec25;
+    const uint8_t *matcap_spec75 = (const uint8_t *)mats->spec75;
+
+    const uint16_t *p_ptr = packed16;
+    register uint32_t *dst = out_lighting_interleaved;
+    register size_t blocks = n / DECODE_INTERLEAVED8_PIXELS;
+
     // decode the packed buffer normals and matcaps into lighting buffers on CPU, 
     // so the RSP doesn't have to decode it itself (which it can't adequately) 
-    // and just let it access linear buffers, and that's the fastest way to do it
-
-    for (register size_t i = 0; i < n; i++) {
-        const register uint16_t p = packed16[i]; // RRRRRXXXXXYYYY0M
-        register uint16_t index = 0;
-
-        // The emission 'bit' works like this: if roughness is set to 0, then use index = 0,
-        // where the matcaps encode diffuse = 1.0 and specular = 0.0 making it a passthrough,
-        // otherwise do the PBR workflow. 
-		// 
-        // If the packed buffer is initialized to 0 (as is the case when not drawn to it), 
-		// then it will also be a passthrough
-        if(p & 0b11110'00000'00000'0) {
-            index = p & 0b00000'11111'11110'0; // 00000YYYYYXXXX00
+    // and just let it access linear buffers
+    while (blocks--) {
+        uint32_t offsets[DECODE_INTERLEAVED8_PIXELS];
+        // AND with a mask
+        for(int i = 0; i < DECODE_INTERLEAVED8_PIXELS; i++) {
+            offsets[i] = packed_to_matcap_byte_index(p_ptr[i]);
         }
 
         // Create Dirty Exclusive for the lighting buffers to not read them to cache
-        // TODO: doesn't work, just an uncached address is faster here
-        /*if(i % 4 == 0) {
-            asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" (&out_diffuse[i]));
-            asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" (&out_rough25[i]));
-            asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" (&out_rough75[i]));
-        }*/
+        // TODO: doesn't work, cached address is faster here for some reason
 
-        out_diffuse[i] = load_matcap_u32(matcap_diffuse, index);
-        out_rough25[i] = load_matcap_u32(matcap_rough25, index);
-        out_rough75[i] = load_matcap_u32(matcap_rough75, index);
-    }
-    //assert(!packed16);
-}
-
-void decode_packed_cpu_interleaved8(const uint16_t *albedo16,
-                                    const uint16_t *packed16,
-                                    uint8_t *out_interleaved,
-                                    int w,
-                                    int h,
-                                    const MatcapSet *mats)
-{
-    const size_t n = (size_t)w * (size_t)h;
-    assertf((n % DECODE_INTERLEAVED8_PIXELS) == 0,
-            "decode_packed_cpu_interleaved8: pixel count must be multiple of 8");
-
-    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
-    const uint8_t *matcap_rough25 = (const uint8_t *)mats->rough25;
-    const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
-
-    const uint16_t *a_ptr = albedo16;
-    const uint16_t *p_ptr = packed16;
-    uint8_t *dst = out_interleaved;
-    size_t blocks = n / DECODE_INTERLEAVED8_PIXELS;
-
-    while (blocks--) {
-        copy_16bytes(dst + DECODE_INTERLEAVED8_OFF_ALBEDO, a_ptr);
-        copy_16bytes(dst + DECODE_INTERLEAVED8_OFF_PACKED, p_ptr);
-
-        uint32_t *out_diff = (uint32_t *)(dst + DECODE_INTERLEAVED8_OFF_DIFFUSE);
-        uint32_t *out_r25 = (uint32_t *)(dst + DECODE_INTERLEAVED8_OFF_ROUGH25);
-        uint32_t *out_r75 = (uint32_t *)(dst + DECODE_INTERLEAVED8_OFF_ROUGH75);
-
-        #define DECODE_STORE_1(px) do { \
-            const uint16_t idx = packed_to_matcap_byte_index(p_ptr[(px)]); \
-            out_diff[(px)] = load_matcap_u32(matcap_diffuse, idx); \
-            out_r25[(px)] = load_matcap_u32(matcap_rough25, idx); \
-            out_r75[(px)] = load_matcap_u32(matcap_rough75, idx); \
-        } while (0)
-
-        DECODE_STORE_1(0);
-        DECODE_STORE_1(1);
-        DECODE_STORE_1(2);
-        DECODE_STORE_1(3);
-        DECODE_STORE_1(4);
-        DECODE_STORE_1(5);
-        DECODE_STORE_1(6);
-        DECODE_STORE_1(7);
-
-        #undef DECODE_STORE_1
-
-        a_ptr += DECODE_INTERLEAVED8_PIXELS;
-        p_ptr += DECODE_INTERLEAVED8_PIXELS;
-        dst += DECODE_INTERLEAVED8_BLOCK_BYTES;
-    }
-}
-
-void decode_packed_cpu_lighting_interleaved8(const uint16_t *packed16,
-                                             uint8_t *out_lighting_interleaved,
-                                             int w,
-                                             int h,
-                                             const MatcapSet *mats)
-{
-    const size_t n = (size_t)w * (size_t)h;
-    assertf((n % DECODE_INTERLEAVED8_PIXELS) == 0,
-            "decode_packed_cpu_lighting_interleaved8: pixel count must be multiple of 8");
-
-    const uint8_t *matcap_diffuse = (const uint8_t *)mats->diffuse;
-    const uint8_t *matcap_rough25 = (const uint8_t *)mats->rough25;
-    const uint8_t *matcap_rough75 = (const uint8_t *)mats->rough75;
-
-    const uint16_t *p_ptr = packed16;
-    register uint8_t *dst = out_lighting_interleaved;
-    size_t blocks = n / DECODE_INTERLEAVED8_PIXELS;
-
-    while (blocks--) {
-        register uint32_t *out_diff = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_DIFFUSE);
-        register uint32_t *out_r25 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH25);
-        register uint32_t *out_r75 = (uint32_t *)(dst + DECODE_LIGHTING_INTERLEAVED8_OFF_ROUGH75);
-
-        #define DECODE_LIGHTING_STORE_1(px) do { \
-            const uint16_t idx = packed_to_matcap_byte_index(p_ptr[(px)]); \
-            out_diff[(px)] = load_matcap_u32(matcap_diffuse, idx); \
-            out_r25[(px)] = load_matcap_u32(matcap_rough25, idx); \
-            out_r75[(px)] = load_matcap_u32(matcap_rough75, idx); \
-        } while (0)
-
-        //asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" ((void*)out_diff));
-        DECODE_LIGHTING_STORE_1(0);
-        DECODE_LIGHTING_STORE_1(1);
-        DECODE_LIGHTING_STORE_1(2);
-        DECODE_LIGHTING_STORE_1(3);
-        //asm ("\tcache %0,(%1)\n"::"i" (CACHE_OP_DIRTY), "r" ((void*)(out_diff + 16)));
-        DECODE_LIGHTING_STORE_1(4);
-        DECODE_LIGHTING_STORE_1(5);
-        DECODE_LIGHTING_STORE_1(6);
-        DECODE_LIGHTING_STORE_1(7);
-        #undef DECODE_LIGHTING_STORE_1
-
-        p_ptr += DECODE_INTERLEAVED8_PIXELS;
-        dst += DECODE_LIGHTING_INTERLEAVED8_BLOCK_BYTES;
-    }
-}
-
-/*
-// too slow because of cache misses
-void decode_deferred_cpu_5bit(const uint16_t *packed16,
-                              uint32_t *out_diffuse,
-                              uint32_t *out_specular,
-                              int w,
-                              int h,
-                              const uint32_t *matcap_diffuse,
-                              const uint32_t *matcap_specular)
-{
-    register size_t n = (size_t)w * (size_t)h;
-
-    // Treat inputs as u16 stream so masked indices can be used directly.
-    // Diffuse: 32x32x1. Specular: 32x32x16.
-    const uint16_t *matcap_diffuse_u16 = (const uint16_t *)matcap_diffuse;
-    const uint16_t *matcap_specular_u16 = (const uint16_t *)matcap_specular;
-
-    // decode the packed buffer into matcap buffers, so the RSP doesn't have to decode it
-    for (register size_t i = 0; i < n; i++) {
-
-        register uint16_t index_diffuse = 0;
-        register uint16_t index_specular = 0;
-
-        const register uint16_t p = packed16[i]; // ERRRRYYYYYXXXXXM
-
-        // The emission bit works like this: if set to 0, then use index = 0,
-        // where diffuse = 1.0 and specular = 0.0, otherwise work as usual
-        if(p < 0x8000){
-            index_specular = p & 0b0111111111111110;
-            index_diffuse = p & 0b0000011111111110;
+        // access via the offsets
+        for(int i = 0; i < DECODE_INTERLEAVED8_PIXELS; i++){
+            dst[i] = load_matcap_u32(matcap_diffuse, offsets[i]);
         }
+        dst+=8;
 
-        out_diffuse[i] = *(const uint32_t *)&matcap_diffuse_u16[index_diffuse];
-        out_specular[i] = *(const uint32_t *)&matcap_specular_u16[index_specular];
+        for(int i = 0; i < DECODE_INTERLEAVED8_PIXELS; i++){
+            dst[i] = load_matcap_u32(matcap_spec25, offsets[i]);
+        }
+        dst+=8;
+
+        for(int i = 0; i < DECODE_INTERLEAVED8_PIXELS; i++){
+            dst[i] = load_matcap_u32(matcap_spec75, offsets[i]);
+        }
+        dst+=8;
+
+        p_ptr+=DECODE_INTERLEAVED8_PIXELS;
     }
-
 }
-*/
